@@ -226,7 +226,8 @@ defmodule Sxf.TasksTest do
 
     assert {:ok, %{task: reopened}} =
              transition(cancelled, fixture.human_actor, "READY", 4, %{
-               human_decision_id: decision.id
+               human_decision_id: decision.id,
+               event_id: decision.target_id
              })
 
     assert reopened.state == "READY"
@@ -278,7 +279,12 @@ defmodule Sxf.TasksTest do
     assert {:error, :approved_human_decision_required} =
              Tasks.resolve_blocker(blocker.id, resolution)
 
-    decision = decision_fixture(fixture.task, fixture.human_actor, "budget_override")
+    decision =
+      decision_fixture(fixture.task, fixture.human_actor, "budget_override", %{
+        target_type: "blocker_resolution",
+        target_id: blocker.id,
+        target_action: "resolve:budget_exhausted"
+      })
 
     assert {:ok, %{blocker: resolved}} =
              Tasks.resolve_blocker(

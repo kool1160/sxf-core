@@ -85,6 +85,7 @@ defmodule Sxf.TestFixtures do
       backend: "test-backend",
       backend_session_id: "session-1",
       idempotency_key: "attempt:1",
+      request_fingerprint: String.duplicate("f", 64),
       started_at: @base_time
     }
 
@@ -148,6 +149,14 @@ defmodule Sxf.TestFixtures do
   end
 
   def decision_fixture(task, actor, kind, attrs \\ %{}) do
+    target_action =
+      case kind do
+        "deploy_approval" -> "DEPLOYED"
+        "reopen" -> "READY"
+        "cancel" -> "CANCELLED"
+        _ -> "APPROVED"
+      end
+
     defaults = %{
       id: uuid(),
       task_id: task.id,
@@ -157,7 +166,10 @@ defmodule Sxf.TestFixtures do
       reason: "explicit operator decision",
       occurred_at: @base_time,
       correlation_id: uuid(),
-      idempotency_key: "decision:#{kind}:#{System.unique_integer([:positive])}"
+      idempotency_key: "decision:#{kind}:#{System.unique_integer([:positive])}",
+      target_type: "transition",
+      target_id: uuid(),
+      target_action: target_action
     }
 
     {:ok, %{decision: decision}} = Tasks.record_human_decision(Map.merge(defaults, attrs))

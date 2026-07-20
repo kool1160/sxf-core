@@ -118,7 +118,10 @@ defmodule Sxf.Tasks.RecordsTest do
       reason: decision.reason,
       occurred_at: decision.occurred_at,
       correlation_id: decision.correlation_id,
-      idempotency_key: decision.idempotency_key
+      idempotency_key: decision.idempotency_key,
+      target_type: decision.target_type,
+      target_id: decision.target_id,
+      target_action: decision.target_action
     }
 
     assert {:ok, %{decision: replay, idempotent?: true}} =
@@ -135,7 +138,10 @@ defmodule Sxf.Tasks.RecordsTest do
                reason: "system cannot impersonate a human",
                occurred_at: base_time(),
                correlation_id: uuid(),
-               idempotency_key: "invalid-system-approval"
+               idempotency_key: "invalid-system-approval",
+               target_type: "transition",
+               target_id: uuid(),
+               target_action: "APPROVED"
              })
   end
 

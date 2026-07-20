@@ -7,7 +7,9 @@
 ## Decision
 
 SXF will represent task lifecycle facts in an append-oriented `task_transition_events` ledger and
-maintain `tasks` as the current projection. Ecto writes the event and projection in one transaction.
+maintain `tasks` as the current projection. Each event has a gap-free, monotonic sequence within its
+task, and the task stores the matching projection version. Ecto writes the event and projection in
+one transaction.
 Phase 1 stores the records in SQLite WAL, as selected by ADR 0002, while UUID identities and domain
 rules remain independent of the database, tracker, and agent backend.
 
@@ -15,6 +17,13 @@ The lifecycle and preconditions in [`docs/TASK_DOMAIN.md`](../TASK_DOMAIN.md) ar
 `BLOCKED` is nonterminal. `FAILED` and `CANCELLED` are reopenable terminal states requiring an
 explicit human decision and available budget. `DEPLOYED` is permanently terminal. Unknown outcomes,
 expired leases, worker loss, and budget/runtime exhaustion block rather than imply success.
+
+Database constraints enforce aggregate ownership: repository registrations must belong to the
+task's project, and every task/attempt pair must reference one attempt owned by that task. Human
+decisions are capabilities for one exact action, represented by target type, target UUID, and target
+action; the consuming transition or blocker resolution stores the decision ID and may consume it
+only once. Every implemented idempotent command persists a deterministic fingerprint covering all
+accepted semantic inputs and conflicts on any changed input.
 
 ## Context
 
@@ -33,6 +42,9 @@ Positive consequences:
 
 - a process restart cannot erase authoritative task state or retry deadlines;
 - a duplicate command returns the original event or an explicit conflict;
+- equal timestamps still produce one deterministic history order and projection version;
+- cross-project repository and cross-task attempt associations fail at the database boundary;
+- an approval cannot be replayed for a different transition or blocker action;
 - current-state queries remain cheap while history stays inspectable;
 - provider and agent adapters can be replaced without migrating primary identities; and
 - deterministic tests can supply observation times and avoid sleeps.
@@ -44,6 +56,8 @@ Costs and risks:
 - enum membership is enforced at the Ecto command boundary because portable SQLite `ALTER TABLE`
   check constraints are unavailable through the adapter;
 - append-only protection currently depends on the domain boundary rather than database triggers;
+- callers that use a human decision must allocate the target transition UUID before recording the
+  decision, adding a small amount of command-protocol ceremony;
 - the local evidence byte store, inbox processor, and outbox dispatcher are still unimplemented;
   and
 - future state/edge changes require explicit migration and compatibility review.

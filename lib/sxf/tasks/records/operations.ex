@@ -47,6 +47,7 @@ defmodule Sxf.Tasks.EventEvidenceReference do
 
   @primary_key false
   schema "event_evidence_references" do
+    belongs_to :task, Sxf.Tasks.Task
     belongs_to :transition_event, Sxf.Tasks.TransitionEvent, primary_key: true
     belongs_to :evidence_reference, Sxf.Tasks.EvidenceReference, primary_key: true
     field :attached_at, :utc_datetime_usec
@@ -54,8 +55,9 @@ defmodule Sxf.Tasks.EventEvidenceReference do
 
   def changeset(reference, attrs) do
     reference
-    |> cast(attrs, [:transition_event_id, :evidence_reference_id, :attached_at])
-    |> validate_required([:transition_event_id, :evidence_reference_id, :attached_at])
+    |> cast(attrs, [:task_id, :transition_event_id, :evidence_reference_id, :attached_at])
+    |> validate_required([:task_id, :transition_event_id, :evidence_reference_id, :attached_at])
+    |> foreign_key_constraint(:task_id)
     |> foreign_key_constraint(:transition_event_id)
     |> foreign_key_constraint(:evidence_reference_id)
     |> unique_constraint([:transition_event_id, :evidence_reference_id])
@@ -132,6 +134,7 @@ defmodule Sxf.Tasks.UsageEntry do
     field :occurred_at, :utc_datetime_usec
     field :correlation_id, Ecto.UUID
     field :idempotency_key, :string
+    field :request_fingerprint, :string
     field :metadata, :map, default: %{}
     belongs_to :budget, Sxf.Tasks.Budget
     belongs_to :task, Sxf.Tasks.Task
@@ -155,6 +158,7 @@ defmodule Sxf.Tasks.UsageEntry do
       :occurred_at,
       :correlation_id,
       :idempotency_key,
+      :request_fingerprint,
       :metadata
     ])
     |> validate_required([
@@ -165,10 +169,12 @@ defmodule Sxf.Tasks.UsageEntry do
       :quantity,
       :occurred_at,
       :correlation_id,
-      :idempotency_key
+      :idempotency_key,
+      :request_fingerprint
     ])
     |> validate_inclusion(:metric, @metrics)
     |> validate_number(:quantity, greater_than_or_equal_to: 0)
+    |> validate_format(:request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:budget_id)
     |> foreign_key_constraint(:task_id)
     |> foreign_key_constraint(:attempt_id)
@@ -191,6 +197,7 @@ defmodule Sxf.Tasks.RetrySchedule do
     field :resume_state, :string
     field :correlation_id, Ecto.UUID
     field :idempotency_key, :string
+    field :request_fingerprint, :string
     field :claimed_at, :utc_datetime_usec
     field :finished_at, :utc_datetime_usec
     field :metadata, :map, default: %{}
@@ -212,6 +219,7 @@ defmodule Sxf.Tasks.RetrySchedule do
       :resume_state,
       :correlation_id,
       :idempotency_key,
+      :request_fingerprint,
       :claimed_at,
       :finished_at,
       :metadata
@@ -224,11 +232,13 @@ defmodule Sxf.Tasks.RetrySchedule do
       :reason,
       :resume_state,
       :correlation_id,
-      :idempotency_key
+      :idempotency_key,
+      :request_fingerprint
     ])
     |> validate_number(:sequence, greater_than: 0)
     |> validate_inclusion(:status, @statuses)
     |> validate_inclusion(:resume_state, Sxf.Tasks.StateMachine.nonterminal_states())
+    |> validate_format(:request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:task_id)
     |> foreign_key_constraint(:attempt_id)
     |> unique_constraint([:task_id, :sequence])
@@ -321,13 +331,14 @@ defmodule Sxf.Tasks.Blocker do
     field :resolved_at, :utc_datetime_usec
     field :resolution_idempotency_key, :string
     field :resolution_correlation_id, Ecto.UUID
-    field :resolution_human_decision_id, Ecto.UUID
+    field :resolution_request_fingerprint, :string
     field :correlation_id, Ecto.UUID
     field :metadata, :map, default: %{}
     belongs_to :task, Sxf.Tasks.Task
     belongs_to :attempt, Sxf.Tasks.TaskAttempt
     belongs_to :created_by_actor, Sxf.Tasks.Actor
     belongs_to :resolved_by_actor, Sxf.Tasks.Actor
+    belongs_to :resolution_human_decision, Sxf.Tasks.HumanDecision
     timestamps()
   end
 
@@ -350,6 +361,7 @@ defmodule Sxf.Tasks.Blocker do
       :resolution_idempotency_key,
       :resolution_correlation_id,
       :resolution_human_decision_id,
+      :resolution_request_fingerprint,
       :correlation_id,
       :metadata
     ])
@@ -370,6 +382,9 @@ defmodule Sxf.Tasks.Blocker do
     |> foreign_key_constraint(:attempt_id)
     |> foreign_key_constraint(:created_by_actor_id)
     |> foreign_key_constraint(:resolved_by_actor_id)
+    |> foreign_key_constraint(:resolution_human_decision_id)
+    |> validate_format(:resolution_request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
+    |> unique_constraint(:resolution_human_decision_id)
   end
 end
 
@@ -387,6 +402,10 @@ defmodule Sxf.Tasks.HumanDecision do
     field :occurred_at, :utc_datetime_usec
     field :correlation_id, Ecto.UUID
     field :idempotency_key, :string
+    field :target_type, :string
+    field :target_id, Ecto.UUID
+    field :target_action, :string
+    field :request_fingerprint, :string
     field :metadata, :map, default: %{}
     belongs_to :task, Sxf.Tasks.Task
     belongs_to :actor, Sxf.Tasks.Actor
@@ -407,6 +426,10 @@ defmodule Sxf.Tasks.HumanDecision do
       :occurred_at,
       :correlation_id,
       :idempotency_key,
+      :target_type,
+      :target_id,
+      :target_action,
+      :request_fingerprint,
       :metadata
     ])
     |> validate_required([
@@ -417,10 +440,17 @@ defmodule Sxf.Tasks.HumanDecision do
       :reason,
       :occurred_at,
       :correlation_id,
-      :idempotency_key
+      :idempotency_key,
+      :target_type,
+      :target_id,
+      :target_action,
+      :request_fingerprint
     ])
     |> validate_inclusion(:kind, @kinds)
     |> validate_inclusion(:decision, @decisions)
+    |> validate_inclusion(:target_type, ~w(transition blocker_resolution))
+    |> validate_length(:target_action, min: 1)
+    |> validate_format(:request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:task_id)
     |> foreign_key_constraint(:actor_id)
     |> foreign_key_constraint(:evidence_reference_id)

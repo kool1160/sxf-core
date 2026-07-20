@@ -65,6 +65,8 @@ defmodule Sxf.Tasks do
     required = [:task_id, :sequence, :idempotency_key]
 
     with :ok <- require_keys(attrs, required) do
+      attrs = Map.put(attrs, :request_fingerprint, attempt_fingerprint(attrs))
+
       Repo.transaction(fn -> do_create_attempt(attrs) end)
       |> flatten_transaction()
     end
@@ -83,6 +85,8 @@ defmodule Sxf.Tasks do
     ]
 
     with :ok <- require_keys(attrs, required) do
+      attrs = Map.put(attrs, :request_fingerprint, retry_fingerprint(attrs))
+
       Repo.transaction(fn -> do_schedule_retry(attrs) end)
       |> flatten_transaction()
     end
@@ -98,10 +102,15 @@ defmodule Sxf.Tasks do
       :reason,
       :occurred_at,
       :correlation_id,
-      :idempotency_key
+      :idempotency_key,
+      :target_type,
+      :target_id,
+      :target_action
     ]
 
     with :ok <- require_keys(attrs, required) do
+      request_fingerprint = decision_fingerprint(attrs)
+
       Repo.transaction(fn ->
         actor = Repo.get(Actor, attrs.actor_id) || Repo.rollback(:actor_not_found)
 
@@ -109,19 +118,21 @@ defmodule Sxf.Tasks do
           Repo.rollback(:human_actor_required)
         end
 
+        validate_decision_target(attrs)
+
         case Repo.get_by(HumanDecision,
                task_id: attrs.task_id,
                idempotency_key: attrs.idempotency_key
              ) do
           nil ->
             %HumanDecision{}
-            |> HumanDecision.changeset(attrs)
+            |> HumanDecision.changeset(Map.put(attrs, :request_fingerprint, request_fingerprint))
             |> Repo.insert()
             |> unwrap_or_rollback()
             |> then(&%{decision: &1, idempotent?: false})
 
           %HumanDecision{} = decision ->
-            if same_decision?(decision, attrs) do
+            if decision.request_fingerprint == request_fingerprint do
               %{decision: decision, idempotent?: true}
             else
               Repo.rollback(:idempotency_conflict)
@@ -138,6 +149,15 @@ defmodule Sxf.Tasks do
     |> where([retry], retry.status == "scheduled" and retry.due_at <= ^observed_at)
     |> order_by([retry], asc: retry.due_at, asc: retry.sequence, asc: retry.id)
     |> Repo.all()
+  end
+
+  @doc "Returns task transition history in its authoritative, gap-free per-task sequence."
+  def task_history(task_id) do
+    Repo.all(
+      from event in TransitionEvent,
+        where: event.task_id == ^task_id,
+        order_by: [asc: event.sequence]
+    )
   end
 
   @doc "Returns the durable inputs a scheduler must reconcile after process restart."
@@ -175,6 +195,8 @@ defmodule Sxf.Tasks do
         if StateMachine.terminal?(task.state) do
           Repo.rollback(:terminal_task_cannot_be_blocked)
         end
+
+        load_attempt(task.id, Map.get(attrs, :attempt_id))
 
         transition_attrs =
           attrs
@@ -236,16 +258,15 @@ defmodule Sxf.Tasks do
     required = [:actor_id, :occurred_at, :correlation_id, :idempotency_key]
 
     with :ok <- require_keys(attrs, required) do
+      request_fingerprint = blocker_resolution_fingerprint(blocker_id, attrs)
+
       Repo.transaction(fn ->
         blocker = Repo.get(Blocker, blocker_id) || Repo.rollback(:blocker_not_found)
         validate_blocker_resolution_authority(blocker, attrs)
 
         case blocker.status do
           "resolved" when blocker.resolution_idempotency_key == attrs.idempotency_key ->
-            if blocker.resolved_by_actor_id == attrs.actor_id and
-                 blocker.resolved_at == attrs.occurred_at and
-                 blocker.resolution_correlation_id == attrs.correlation_id and
-                 blocker.resolution_human_decision_id == Map.get(attrs, :human_decision_id) do
+            if blocker.resolution_request_fingerprint == request_fingerprint do
               %{blocker: blocker, idempotent?: true}
             else
               Repo.rollback(:idempotency_conflict)
@@ -263,6 +284,7 @@ defmodule Sxf.Tasks do
               resolution_idempotency_key: attrs.idempotency_key,
               resolution_correlation_id: attrs.correlation_id,
               resolution_human_decision_id: Map.get(attrs, :human_decision_id),
+              resolution_request_fingerprint: request_fingerprint,
               metadata: Map.merge(blocker.metadata, Map.get(attrs, :metadata, %{}))
             })
             |> Repo.update()
@@ -288,6 +310,8 @@ defmodule Sxf.Tasks do
     ]
 
     with :ok <- require_keys(attrs, required) do
+      attrs = Map.put(attrs, :request_fingerprint, usage_fingerprint(attrs))
+
       Repo.transaction(fn -> do_record_usage(attrs) end)
       |> flatten_transaction()
     end
@@ -308,11 +332,20 @@ defmodule Sxf.Tasks do
   end
 
   defp create_new_task(attrs, fingerprint) do
+    registration =
+      Repo.get(Sxf.Tasks.RepositoryRegistration, attrs.repository_registration_id) ||
+        Repo.rollback(:repository_registration_not_found)
+
+    if registration.project_id != attrs.project_id do
+      Repo.rollback(:repository_project_mismatch)
+    end
+
     task_attrs =
       attrs
       |> Map.take([:id, :project_id, :repository_registration_id, :title, :source_ref, :metadata])
       |> Map.put(:state, "DISCOVERED")
       |> Map.put(:last_transition_at, attrs.occurred_at)
+      |> Map.put(:transition_sequence, 1)
 
     task =
       %Task{}
@@ -320,7 +353,7 @@ defmodule Sxf.Tasks do
       |> Repo.insert()
       |> unwrap_or_rollback()
 
-    event_attrs = event_attrs(task, nil, attrs, "DISCOVERED", fingerprint)
+    event_attrs = event_attrs(task, nil, attrs, "DISCOVERED", fingerprint, 1)
 
     event =
       %TransitionEvent{}
@@ -361,6 +394,8 @@ defmodule Sxf.Tasks do
 
   defp apply_new_transition(task_id, attrs, fingerprint) do
     task = Repo.get(Task, task_id) || Repo.rollback(:task_not_found)
+    attrs = Map.put_new(attrs, :event_id, Sxf.Identifiers.generate())
+    sequence = task.transition_sequence + 1
 
     if DateTime.compare(attrs.occurred_at, task.last_transition_at) == :lt do
       Repo.rollback(:out_of_order_transition)
@@ -383,7 +418,7 @@ defmodule Sxf.Tasks do
     event =
       %TransitionEvent{}
       |> TransitionEvent.changeset(
-        event_attrs(task, task.state, attrs, attrs.resulting_state, fingerprint)
+        event_attrs(task, task.state, attrs, attrs.resulting_state, fingerprint, sequence)
       )
       |> Repo.insert()
       |> unwrap_or_rollback()
@@ -393,7 +428,7 @@ defmodule Sxf.Tasks do
     task =
       task
       |> Task.transition_changeset(
-        projection_attrs(task, attrs.resulting_state, attrs.occurred_at)
+        projection_attrs(task, attrs.resulting_state, attrs.occurred_at, sequence)
       )
       |> Repo.update()
       |> unwrap_or_rollback()
@@ -404,7 +439,16 @@ defmodule Sxf.Tasks do
   defp transition_context(task, attrs, evidence) do
     attempt = load_attempt(task.id, Map.get(attrs, :attempt_id))
     actor = Repo.get(Actor, attrs.actor_id) || Repo.rollback(:actor_not_found)
-    decision = load_decision(task.id, Map.get(attrs, :human_decision_id))
+
+    decision =
+      load_decision(
+        task.id,
+        Map.get(attrs, :human_decision_id),
+        "transition",
+        attrs.event_id,
+        attrs.resulting_state
+      )
+
     occurred_at = attrs.occurred_at
 
     %{
@@ -426,7 +470,7 @@ defmodule Sxf.Tasks do
     }
   end
 
-  defp projection_attrs(task, resulting_state, occurred_at) do
+  defp projection_attrs(task, resulting_state, occurred_at, sequence) do
     terminal? = StateMachine.terminal?(resulting_state)
 
     %{
@@ -439,14 +483,16 @@ defmodule Sxf.Tasks do
           true -> task.resume_state
         end,
       terminal_at: if(terminal?, do: occurred_at, else: nil),
-      last_transition_at: occurred_at
+      last_transition_at: occurred_at,
+      transition_sequence: sequence
     }
   end
 
-  defp event_attrs(task, prior_state, attrs, resulting_state, fingerprint) do
+  defp event_attrs(task, prior_state, attrs, resulting_state, fingerprint, sequence) do
     %{
       id: Map.get(attrs, :event_id),
       task_id: task.id,
+      sequence: sequence,
       attempt_id: Map.get(attrs, :attempt_id),
       actor_id: attrs.actor_id,
       prior_state: prior_state,
@@ -457,6 +503,7 @@ defmodule Sxf.Tasks do
       correlation_id: attrs.correlation_id,
       idempotency_key: attrs.idempotency_key,
       request_fingerprint: fingerprint,
+      human_decision_id: Map.get(attrs, :human_decision_id),
       metadata: Map.get(attrs, :metadata, %{})
     }
   end
@@ -494,14 +541,22 @@ defmodule Sxf.Tasks do
     end
   end
 
-  defp load_decision(_task_id, nil), do: nil
+  defp load_decision(_task_id, nil, _target_type, _target_id, _target_action), do: nil
 
-  defp load_decision(task_id, decision_id) do
+  defp load_decision(task_id, decision_id, target_type, target_id, target_action) do
     case Repo.get(HumanDecision, decision_id) do
       %HumanDecision{task_id: ^task_id} = decision ->
         case Repo.get(Actor, decision.actor_id) do
-          %Actor{kind: "human"} -> decision
-          _ -> Repo.rollback(:invalid_human_decision_actor)
+          %Actor{kind: "human"} ->
+            if decision.target_type == target_type and decision.target_id == target_id and
+                 decision.target_action == target_action do
+              decision
+            else
+              Repo.rollback(:decision_scope_mismatch)
+            end
+
+          _ ->
+            Repo.rollback(:invalid_human_decision_actor)
         end
 
       %HumanDecision{} ->
@@ -526,13 +581,69 @@ defmodule Sxf.Tasks do
           nil
       end
 
-    if expected_decision do
-      decision = load_decision(blocker.task_id, Map.get(attrs, :human_decision_id))
+    decision =
+      if Map.get(attrs, :human_decision_id) do
+        load_decision(
+          blocker.task_id,
+          Map.get(attrs, :human_decision_id),
+          "blocker_resolution",
+          blocker.id,
+          "resolve:#{blocker.kind}"
+        )
+      end
 
-      unless approved_decision?(decision, expected_decision) and
-               decision.actor_id == attrs.actor_id do
+    if decision && decision.actor_id != attrs.actor_id do
+      Repo.rollback(:decision_actor_mismatch)
+    end
+
+    if expected_decision do
+      unless approved_decision?(decision, expected_decision) do
         Repo.rollback(:approved_human_decision_required)
       end
+    end
+
+    :ok
+  end
+
+  defp validate_decision_target(attrs) do
+    Repo.get(Task, attrs.task_id) || Repo.rollback(:task_not_found)
+
+    if evidence_id = Map.get(attrs, :evidence_reference_id) do
+      case Repo.get(EvidenceReference, evidence_id) do
+        %EvidenceReference{task_id: task_id} when task_id == attrs.task_id -> :ok
+        %EvidenceReference{} -> Repo.rollback(:evidence_task_mismatch)
+        nil -> Repo.rollback(:evidence_not_found)
+      end
+    end
+
+    case attrs.target_type do
+      "transition" ->
+        unless Sxf.Identifiers.valid?(attrs.target_id) and
+                 attrs.target_action in StateMachine.states() do
+          Repo.rollback(:invalid_decision_target)
+        end
+
+      "blocker_resolution" ->
+        case Repo.get(Blocker, attrs.target_id) do
+          %Blocker{task_id: task_id, kind: kind} when task_id == attrs.task_id ->
+            if attrs.target_action == "resolve:#{kind}" do
+              :ok
+            else
+              Repo.rollback(:invalid_decision_target)
+            end
+
+          %Blocker{task_id: task_id} when task_id != attrs.task_id ->
+            Repo.rollback(:decision_target_task_mismatch)
+
+          %Blocker{} ->
+            Repo.rollback(:invalid_decision_target)
+
+          nil ->
+            Repo.rollback(:decision_target_not_found)
+        end
+
+      _ ->
+        Repo.rollback(:invalid_decision_target)
     end
 
     :ok
@@ -544,6 +655,7 @@ defmodule Sxf.Tasks do
     Enum.each(evidence, fn item ->
       %EventEvidenceReference{}
       |> EventEvidenceReference.changeset(%{
+        task_id: event.task_id,
         transition_event_id: event.id,
         evidence_reference_id: item.id,
         attached_at: occurred_at
@@ -629,14 +741,6 @@ defmodule Sxf.Tasks do
 
   defp cancellation_authorized?(_actor, decision), do: approved_decision?(decision, "cancel")
 
-  defp same_decision?(decision, attrs) do
-    decision.actor_id == attrs.actor_id and decision.kind == attrs.kind and
-      decision.decision == attrs.decision and decision.reason == attrs.reason and
-      decision.occurred_at == attrs.occurred_at and
-      decision.correlation_id == attrs.correlation_id and
-      decision.evidence_reference_id == Map.get(attrs, :evidence_reference_id)
-  end
-
   defp event_by_key(task_id, idempotency_key) do
     Repo.one(
       from event in TransitionEvent,
@@ -647,7 +751,7 @@ defmodule Sxf.Tasks do
   defp do_create_attempt(attrs) do
     case Repo.get_by(TaskAttempt, task_id: attrs.task_id, idempotency_key: attrs.idempotency_key) do
       %TaskAttempt{} = attempt ->
-        if same_attempt?(attempt, attrs) do
+        if attempt.request_fingerprint == attrs.request_fingerprint do
           %{attempt: attempt, idempotent?: true}
         else
           Repo.rollback(:idempotency_conflict)
@@ -685,7 +789,7 @@ defmodule Sxf.Tasks do
            idempotency_key: attrs.idempotency_key
          ) do
       %RetrySchedule{} = retry ->
-        if same_retry?(retry, attrs) do
+        if retry.request_fingerprint == attrs.request_fingerprint do
           %{retry: retry, idempotent?: true}
         else
           Repo.rollback(:idempotency_conflict)
@@ -693,6 +797,7 @@ defmodule Sxf.Tasks do
 
       nil ->
         task = Repo.get(Task, attrs.task_id) || Repo.rollback(:task_not_found)
+        load_attempt(task.id, Map.get(attrs, :attempt_id))
 
         if StateMachine.terminal?(task.state) do
           Repo.rollback(:terminal_task_rejects_retry)
@@ -719,7 +824,7 @@ defmodule Sxf.Tasks do
            idempotency_key: attrs.idempotency_key
          ) do
       %UsageEntry{} = entry ->
-        if same_usage?(entry, attrs) do
+        if entry.request_fingerprint == attrs.request_fingerprint do
           %{
             usage: entry,
             exhausted?: Repo.get!(Budget, attrs.budget_id).status == "exhausted",
@@ -741,6 +846,7 @@ defmodule Sxf.Tasks do
         end
 
         task = Repo.get!(Task, attrs.task_id)
+        load_attempt(task.id, Map.get(attrs, :attempt_id))
 
         if StateMachine.terminal?(task.state) do
           Repo.rollback(:terminal_task_rejects_usage)
@@ -885,8 +991,7 @@ defmodule Sxf.Tasks do
     status = if retry_limit_available?, do: "scheduled", else: "exhausted"
     backoff_seconds = retry_backoff_seconds(task.id, next_sequence)
 
-    %RetrySchedule{}
-    |> RetrySchedule.changeset(%{
+    retry_attrs = %{
       task_id: task.id,
       attempt_id: attempt.id,
       sequence: next_sequence,
@@ -898,7 +1003,12 @@ defmodule Sxf.Tasks do
       idempotency_key: "lease-retry:#{lease_id}",
       finished_at: if(status == "exhausted", do: observed_at),
       metadata: %{lease_id: lease_id, backoff_seconds: backoff_seconds}
-    })
+    }
+
+    retry_attrs = Map.put(retry_attrs, :request_fingerprint, retry_fingerprint(retry_attrs))
+
+    %RetrySchedule{}
+    |> RetrySchedule.changeset(retry_attrs)
     |> Repo.insert()
     |> unwrap_or_rollback()
   end
@@ -925,40 +1035,18 @@ defmodule Sxf.Tasks do
   defp limit_for(budget, "repair_cycles"), do: budget.max_repair_cycles
   defp limit_for(budget, "provider_retries"), do: budget.max_provider_retries
 
-  defp same_attempt?(attempt, attrs) do
-    attempt.id == Map.get(attrs, :id, attempt.id) and attempt.sequence == attrs.sequence and
-      attempt.status == Map.get(attrs, :status, "planned") and
-      attempt.backend == Map.get(attrs, :backend) and
-      attempt.backend_session_id == Map.get(attrs, :backend_session_id) and
-      attempt.started_at == Map.get(attrs, :started_at) and
-      attempt.metadata == Map.get(attrs, :metadata, %{})
-  end
-
-  defp same_retry?(retry, attrs) do
-    retry.id == Map.get(attrs, :id, retry.id) and retry.attempt_id == Map.get(attrs, :attempt_id) and
-      retry.sequence == attrs.sequence and retry.status == Map.get(attrs, :status, "scheduled") and
-      retry.due_at == attrs.due_at and retry.reason == attrs.reason and
-      retry.resume_state == attrs.resume_state and retry.correlation_id == attrs.correlation_id and
-      retry.metadata == Map.get(attrs, :metadata, %{})
-  end
-
-  defp same_usage?(entry, attrs) do
-    entry.id == Map.get(attrs, :id, entry.id) and entry.task_id == attrs.task_id and
-      entry.attempt_id == Map.get(attrs, :attempt_id) and entry.actor_id == attrs.actor_id and
-      entry.metric == attrs.metric and entry.quantity == attrs.quantity and
-      entry.occurred_at == attrs.occurred_at and entry.correlation_id == attrs.correlation_id and
-      entry.metadata == Map.get(attrs, :metadata, %{})
-  end
-
   defp creation_fingerprint(attrs) do
     fingerprint(%{
       command: :create_task,
+      event_id: Map.get(attrs, :event_id),
       task_id: attrs.id,
       project_id: attrs.project_id,
       repository_registration_id: attrs.repository_registration_id,
       title: attrs.title,
       source_ref: Map.get(attrs, :source_ref),
       actor_id: attrs.actor_id,
+      attempt_id: Map.get(attrs, :attempt_id),
+      human_decision_id: Map.get(attrs, :human_decision_id),
       reason: attrs.reason,
       reason_code: Map.get(attrs, :reason_code),
       occurred_at: attrs.occurred_at,
@@ -971,7 +1059,11 @@ defmodule Sxf.Tasks do
   defp transition_fingerprint(attrs) do
     fingerprint(%{
       command: :transition_task,
+      event_id: Map.get(attrs, :event_id),
       resulting_state: attrs.resulting_state,
+      blocker_id: Map.get(attrs, :blocker_id),
+      blocker_kind: Map.get(attrs, :kind),
+      blocker_metadata: Map.get(attrs, :blocker_metadata, %{}),
       actor_id: attrs.actor_id,
       attempt_id: Map.get(attrs, :attempt_id),
       human_decision_id: Map.get(attrs, :human_decision_id),
@@ -980,7 +1072,96 @@ defmodule Sxf.Tasks do
       occurred_at: attrs.occurred_at,
       correlation_id: attrs.correlation_id,
       idempotency_key: attrs.idempotency_key,
-      evidence_reference_ids: attrs |> Map.get(:evidence_reference_ids, []) |> Enum.sort(),
+      evidence_reference_ids:
+        attrs |> Map.get(:evidence_reference_ids, []) |> Enum.uniq() |> Enum.sort(),
+      metadata: Map.get(attrs, :metadata, %{})
+    })
+  end
+
+  defp attempt_fingerprint(attrs) do
+    fingerprint(%{
+      command: :create_attempt,
+      id: Map.get(attrs, :id),
+      task_id: attrs.task_id,
+      sequence: attrs.sequence,
+      status: Map.get(attrs, :status, "planned"),
+      backend: Map.get(attrs, :backend),
+      backend_session_id: Map.get(attrs, :backend_session_id),
+      idempotency_key: attrs.idempotency_key,
+      started_at: Map.get(attrs, :started_at),
+      finished_at: Map.get(attrs, :finished_at),
+      outcome: Map.get(attrs, :outcome),
+      metadata: Map.get(attrs, :metadata, %{})
+    })
+  end
+
+  defp retry_fingerprint(attrs) do
+    fingerprint(%{
+      command: :schedule_retry,
+      id: Map.get(attrs, :id),
+      task_id: attrs.task_id,
+      attempt_id: Map.get(attrs, :attempt_id),
+      sequence: attrs.sequence,
+      status: Map.get(attrs, :status, "scheduled"),
+      due_at: attrs.due_at,
+      reason: attrs.reason,
+      resume_state: attrs.resume_state,
+      correlation_id: attrs.correlation_id,
+      idempotency_key: attrs.idempotency_key,
+      claimed_at: Map.get(attrs, :claimed_at),
+      finished_at: Map.get(attrs, :finished_at),
+      metadata: Map.get(attrs, :metadata, %{})
+    })
+  end
+
+  defp usage_fingerprint(attrs) do
+    fingerprint(%{
+      command: :record_usage,
+      id: Map.get(attrs, :id),
+      budget_id: attrs.budget_id,
+      task_id: attrs.task_id,
+      attempt_id: Map.get(attrs, :attempt_id),
+      actor_id: attrs.actor_id,
+      metric: attrs.metric,
+      quantity: attrs.quantity,
+      occurred_at: attrs.occurred_at,
+      correlation_id: attrs.correlation_id,
+      idempotency_key: attrs.idempotency_key,
+      evidence_reference_ids:
+        attrs |> Map.get(:evidence_reference_ids, []) |> Enum.uniq() |> Enum.sort(),
+      metadata: Map.get(attrs, :metadata, %{})
+    })
+  end
+
+  defp decision_fingerprint(attrs) do
+    fingerprint(%{
+      command: :record_human_decision,
+      id: Map.get(attrs, :id),
+      task_id: attrs.task_id,
+      actor_id: attrs.actor_id,
+      evidence_reference_id: Map.get(attrs, :evidence_reference_id),
+      kind: attrs.kind,
+      decision: attrs.decision,
+      reason: attrs.reason,
+      occurred_at: attrs.occurred_at,
+      correlation_id: attrs.correlation_id,
+      idempotency_key: attrs.idempotency_key,
+      target_type: attrs.target_type,
+      target_id: attrs.target_id,
+      target_action: attrs.target_action,
+      metadata: Map.get(attrs, :metadata, %{})
+    })
+  end
+
+  defp blocker_resolution_fingerprint(blocker_id, attrs) do
+    fingerprint(%{
+      command: :resolve_blocker,
+      blocker_id: blocker_id,
+      actor_id: attrs.actor_id,
+      occurred_at: attrs.occurred_at,
+      correlation_id: attrs.correlation_id,
+      idempotency_key: attrs.idempotency_key,
+      human_decision_id: Map.get(attrs, :human_decision_id),
       metadata: Map.get(attrs, :metadata, %{})
     })
   end

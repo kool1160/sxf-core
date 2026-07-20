@@ -88,6 +88,7 @@ defmodule Sxf.Tasks.Task do
     field :resume_state, :string
     field :terminal_at, :utc_datetime_usec
     field :last_transition_at, :utc_datetime_usec
+    field :transition_sequence, :integer, default: 1
     field :lock_version, :integer, default: 1
     field :metadata, :map, default: %{}
     belongs_to :project, Sxf.Tasks.Project
@@ -107,6 +108,7 @@ defmodule Sxf.Tasks.Task do
       :source_ref,
       :state,
       :last_transition_at,
+      :transition_sequence,
       :metadata
     ])
     |> validate_required([
@@ -115,7 +117,8 @@ defmodule Sxf.Tasks.Task do
       :repository_registration_id,
       :title,
       :state,
-      :last_transition_at
+      :last_transition_at,
+      :transition_sequence
     ])
     |> validate_inclusion(:state, Sxf.Tasks.StateMachine.states())
     |> foreign_key_constraint(:project_id)
@@ -124,8 +127,15 @@ defmodule Sxf.Tasks.Task do
 
   def transition_changeset(task, attrs) do
     task
-    |> cast(attrs, [:state, :resume_state, :terminal_at, :last_transition_at])
-    |> validate_required([:state, :last_transition_at])
+    |> cast(attrs, [
+      :state,
+      :resume_state,
+      :terminal_at,
+      :last_transition_at,
+      :transition_sequence
+    ])
+    |> validate_required([:state, :last_transition_at, :transition_sequence])
+    |> validate_number(:transition_sequence, greater_than: 0)
     |> validate_inclusion(:state, Sxf.Tasks.StateMachine.states())
     |> validate_inclusion(:resume_state, Sxf.Tasks.StateMachine.nonterminal_states())
     |> optimistic_lock(:lock_version)
@@ -144,6 +154,7 @@ defmodule Sxf.Tasks.TaskAttempt do
     field :backend, :string
     field :backend_session_id, :string
     field :idempotency_key, :string
+    field :request_fingerprint, :string
     field :started_at, :utc_datetime_usec
     field :finished_at, :utc_datetime_usec
     field :outcome, :string
@@ -164,14 +175,16 @@ defmodule Sxf.Tasks.TaskAttempt do
       :backend,
       :backend_session_id,
       :idempotency_key,
+      :request_fingerprint,
       :started_at,
       :finished_at,
       :outcome,
       :metadata
     ])
-    |> validate_required([:task_id, :sequence, :status, :idempotency_key])
+    |> validate_required([:task_id, :sequence, :status, :idempotency_key, :request_fingerprint])
     |> validate_number(:sequence, greater_than: 0)
     |> validate_inclusion(:status, @statuses)
+    |> validate_format(:request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:task_id)
     |> unique_constraint([:task_id, :sequence])
     |> unique_constraint([:task_id, :idempotency_key])
@@ -183,6 +196,7 @@ defmodule Sxf.Tasks.TransitionEvent do
   use Sxf.Schema
 
   schema "task_transition_events" do
+    field :sequence, :integer
     field :prior_state, :string
     field :resulting_state, :string
     field :reason, :string
@@ -195,6 +209,7 @@ defmodule Sxf.Tasks.TransitionEvent do
     belongs_to :task, Sxf.Tasks.Task
     belongs_to :attempt, Sxf.Tasks.TaskAttempt
     belongs_to :actor, Sxf.Tasks.Actor
+    belongs_to :human_decision, Sxf.Tasks.HumanDecision
 
     many_to_many :evidence_references, Sxf.Tasks.EvidenceReference,
       join_through: Sxf.Tasks.EventEvidenceReference
@@ -207,6 +222,7 @@ defmodule Sxf.Tasks.TransitionEvent do
     |> cast(attrs, [
       :id,
       :task_id,
+      :sequence,
       :attempt_id,
       :actor_id,
       :prior_state,
@@ -217,10 +233,12 @@ defmodule Sxf.Tasks.TransitionEvent do
       :correlation_id,
       :idempotency_key,
       :request_fingerprint,
+      :human_decision_id,
       :metadata
     ])
     |> validate_required([
       :task_id,
+      :sequence,
       :actor_id,
       :resulting_state,
       :reason,
@@ -230,6 +248,7 @@ defmodule Sxf.Tasks.TransitionEvent do
       :request_fingerprint
     ])
     |> validate_length(:reason, min: 1)
+    |> validate_number(:sequence, greater_than: 0)
     |> validate_length(:idempotency_key, min: 1, max: 255)
     |> validate_format(:request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> validate_inclusion(:prior_state, Sxf.Tasks.StateMachine.states())
@@ -237,6 +256,9 @@ defmodule Sxf.Tasks.TransitionEvent do
     |> foreign_key_constraint(:task_id)
     |> foreign_key_constraint(:attempt_id)
     |> foreign_key_constraint(:actor_id)
+    |> foreign_key_constraint(:human_decision_id)
     |> unique_constraint([:task_id, :idempotency_key])
+    |> unique_constraint([:task_id, :sequence])
+    |> unique_constraint(:human_decision_id)
   end
 end
