@@ -122,7 +122,8 @@ happy-path states are illegal.
   budget status, creating the blocker, and transitioning the task are atomic.
 - Lease reconciliation takes an explicit observation time. An expired lease becomes `expired`, its
   running attempt becomes `lost`, the task becomes `BLOCKED`, and a bounded retry row is scheduled.
-  Retry backoff starts at 10 seconds, doubles by sequence, and caps at 300 seconds.
+  Retry backoff starts at 10 seconds, doubles by sequence, applies deterministic task-derived jitter
+  of up to 20 percent, and caps at 300 seconds.
 - If provider-retry capacity is unavailable, the retry row is retained as `exhausted`; the system
   does not loop or convert the unknown attempt into success.
 - `restart_snapshot/1` derives nonterminal tasks, due retries, stale leases, and due pending/unknown

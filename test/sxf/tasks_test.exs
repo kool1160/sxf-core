@@ -360,10 +360,14 @@ defmodule Sxf.TasksTest do
     assert Repo.get!(Task, task.id).state == "BLOCKED"
     assert Repo.get_by!(Blocker, task_id: task.id, kind: "lease_expired")
 
-    assert Repo.get_by!(RetrySchedule,
-             task_id: task.id,
-             idempotency_key: "lease-retry:#{lease.id}"
-           )
+    retry =
+      Repo.get_by!(RetrySchedule,
+        task_id: task.id,
+        idempotency_key: "lease-retry:#{lease.id}"
+      )
+
+    assert retry.metadata["backoff_seconds"] in 8..12
+    assert retry.due_at == DateTime.add(observed_at, retry.metadata["backoff_seconds"], :second)
 
     assert Tasks.reconcile_expired_leases(observed_at, fixture.system_actor.id, uuid()) == []
   end

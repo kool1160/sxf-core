@@ -883,7 +883,7 @@ defmodule Sxf.Tasks do
     next_sequence = sequence + 1
     retry_limit_available? = retry_budget_available?(task.id, attempt.id)
     status = if retry_limit_available?, do: "scheduled", else: "exhausted"
-    backoff_seconds = min(trunc(:math.pow(2, max(next_sequence - 1, 0))) * 10, 300)
+    backoff_seconds = retry_backoff_seconds(task.id, next_sequence)
 
     %RetrySchedule{}
     |> RetrySchedule.changeset(%{
@@ -901,6 +901,14 @@ defmodule Sxf.Tasks do
     })
     |> Repo.insert()
     |> unwrap_or_rollback()
+  end
+
+  defp retry_backoff_seconds(task_id, sequence) do
+    base = min(trunc(:math.pow(2, max(sequence - 1, 0))) * 10, 300)
+    spread = max(div(base, 5), 1)
+    <<sample::unsigned-32, _rest::binary>> = :crypto.hash(:sha256, "#{task_id}:#{sequence}")
+    jitter = rem(sample, spread * 2 + 1) - spread
+    base |> Kernel.+(jitter) |> max(1) |> min(300)
   end
 
   defp retry_budget_available?(task_id, attempt_id) do
