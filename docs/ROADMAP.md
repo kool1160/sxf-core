@@ -2,6 +2,10 @@
 
 The roadmap is organized around working vertical slices. SXF should prove one reliable execution loop before expanding the number of agents, providers, stacks, or dashboards.
 
+## Binding milestone governance
+
+[`MILESTONE_CONTRACT.md`](MILESTONE_CONTRACT.md) defines the mandatory M1 through M7 execution sequence, completion gates, prohibited work, and change-control rules. Humans and automated contributors must follow that contract before selecting, beginning, or reviewing work. This roadmap describes the intended capability progression but does not authorize skipping, combining, or reordering milestones.
+
 ## Phase 0 — Foundation
 
 - Establish product, architecture, security, reliability, and contribution contracts.
