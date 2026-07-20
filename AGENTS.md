@@ -14,10 +14,11 @@ Read these documents before making architectural or behavioral changes:
 
 1. [`docs/PRODUCT.md`](docs/PRODUCT.md) — product goals, users, requirements, and non-goals.
 2. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system boundaries and component responsibilities.
-3. [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries and prohibited behavior.
-4. [`docs/RELIABILITY.md`](docs/RELIABILITY.md) — evidence, retries, idempotency, and failure handling.
-5. [`docs/ROADMAP.md`](docs/ROADMAP.md) — implementation sequence.
-6. [`schemas/project.schema.json`](schemas/project.schema.json) — connected-project manifest contract.
+3. [`docs/TASK_DOMAIN.md`](docs/TASK_DOMAIN.md) — durable records, legal transitions, and recovery semantics.
+4. [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries and prohibited behavior.
+5. [`docs/RELIABILITY.md`](docs/RELIABILITY.md) — evidence, retries, idempotency, and failure handling.
+6. [`docs/ROADMAP.md`](docs/ROADMAP.md) — implementation sequence.
+7. [`schemas/project.schema.json`](schemas/project.schema.json) — connected-project manifest contract.
 
 When documents conflict, stop and surface the conflict rather than silently choosing the easiest interpretation.
 
@@ -49,10 +50,12 @@ DISCOVERED
 → CHANGES_REQUESTED | APPROVED
 → STAGING
 → RELEASE_READY
-→ DEPLOYED | FAILED | BLOCKED
+→ DEPLOYED | FAILED | BLOCKED | CANCELLED
 ```
 
 Every state transition must be persisted and attributable to an event, policy decision, or verified result.
+The exhaustive lifecycle contract, including repair, block/resume, cancellation, failure, and reopen
+edges, is [`docs/TASK_DOMAIN.md`](docs/TASK_DOMAIN.md).
 
 ## Human escalation conditions
 

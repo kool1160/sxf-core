@@ -64,6 +64,10 @@ FAILED
 CANCELLED
 ```
 
+The exhaustive legal edges, preconditions, terminal/reopen rules, and durable record contract are
+defined in [`TASK_DOMAIN.md`](TASK_DOMAIN.md). `BLOCKED` is nonterminal; `FAILED` and `CANCELLED`
+are terminal until an explicit approved reopen; `DEPLOYED` is permanently terminal.
+
 ### Scheduler
 
 Selects ready work while respecting repository concurrency, dependencies, rate limits, cost budgets, workspace capacity, and conflicting file or subsystem ownership.
@@ -136,6 +140,10 @@ Components communicate through durable events rather than direct conversational 
 
 Events must carry stable project, task, attempt, actor, and correlation identifiers.
 
+The Phase 1 implementation uses UUID strings for these identifiers and an append-oriented
+transition ledger with an atomically updated current-state projection. Tracker and agent-session
+identifiers are opaque references, never authoritative task IDs.
+
 ## Data boundaries
 
 SXF platform data:
@@ -161,10 +169,9 @@ The first vertical slice should run locally in containers against one test repos
 
 The following choices require an architecture decision record before implementation:
 
-- Primary implementation language and framework.
-- Database and durable queue.
-- Sandbox technology.
-- First coding-agent backend.
+- Durable queue technology beyond the Phase 1 SQLite retry/outbox records.
+- Sandbox implementation beyond the Linux-container boundary selected in ADR 0002.
+- A second coding-agent backend after the Codex adapter selected in ADR 0002.
 - First verifier model/backend.
 - GitHub App hosting model.
 - Observability stack.

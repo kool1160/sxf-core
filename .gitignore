@@ -35,3 +35,8 @@ Thumbs.db
 *.log
 *.tmp
 *.swp
+# Elixir build output, dependencies, and local durable stores
+/_build/
+/deps/
+/var/
+/erl_crash.dump

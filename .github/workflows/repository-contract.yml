@@ -30,6 +30,7 @@ jobs:
             docs/SECURITY.md
             docs/RELIABILITY.md
             docs/ROADMAP.md
+            docs/TASK_DOMAIN.md
             schemas/project.schema.json
             examples/project.sxf.yaml
           )
@@ -52,3 +53,44 @@ jobs:
             echo "Unresolved merge markers found."
             exit 1
           fi
+
+  durable-core:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Erlang and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28.4"
+          elixir-version: "1.19.5"
+
+      - name: Restore dependency and build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+
+      - name: Install dependencies
+        run: mix deps.get --only test
+
+      - name: Audit dependencies
+        run: mix hex.audit
+
+      - name: Reject unused lock entries
+        run: mix deps.unlock --check-unused
+
+      - name: Verify formatting
+        run: mix format --check-formatted
+
+      - name: Compile without warnings
+        env:
+          MIX_ENV: test
+        run: mix compile --warnings-as-errors
+
+      - name: Run durable-core tests
+        run: mix test

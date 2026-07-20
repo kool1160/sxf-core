@@ -17,6 +17,10 @@ SXF must continue operating correctly when agents fail, tools return partial res
 
 Webhook processing, branch creation, comments, labels, task transitions, workspace creation, and status publication must accept stable idempotency keys. Replaying an event must not duplicate work or corrupt state.
 
+The implemented transition boundary scopes keys to a task and fingerprints the semantic request.
+An exact replay returns the original event; reusing a key for different content is an explicit
+conflict. See [`TASK_DOMAIN.md`](TASK_DOMAIN.md).
+
 ## Failure classes
 
 ### Transient infrastructure failure
@@ -51,6 +55,10 @@ Every task and attempt must have explicit limits for:
 - Workspace resources.
 
 Budget exhaustion transitions the task to `BLOCKED` with evidence and recommended next action.
+
+`BLOCKED` is a durable nonterminal state with a saved resume state. Runtime exhaustion, worker/lease
+loss, and indeterminate outcomes use the same rule. A task resumes only after all blockers are
+resolved and any required human decision is recorded.
 
 ## Health and recovery
 
