@@ -1,0 +1,54 @@
+name: Repository contract
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-foundation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify required documents
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_files=(
+            README.md
+            AGENTS.md
+            CONTRIBUTING.md
+            SECURITY.md
+            docs/PRODUCT.md
+            docs/ARCHITECTURE.md
+            docs/SECURITY.md
+            docs/RELIABILITY.md
+            docs/ROADMAP.md
+            schemas/project.schema.json
+            examples/project.sxf.yaml
+          )
+
+          for file in "${required_files[@]}"; do
+            test -s "$file" || {
+              echo "Required file is missing or empty: $file"
+              exit 1
+            }
+          done
+
+      - name: Validate JSON contracts
+        run: python -m json.tool schemas/project.schema.json > /dev/null
+
+      - name: Check for unresolved merge markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- . ':!*.lock'; then
+            echo "Unresolved merge markers found."
+            exit 1
+          fi
