@@ -1,0 +1,51 @@
+schemaVersion: "0.1"
+
+project:
+  name: example-application
+  description: Example connected repository for SXF onboarding.
+  status: existing
+  documentationRoot: docs
+
+commands:
+  install: npm ci
+  lint: npm run lint
+  typecheck: npm run typecheck
+  test: npm test
+  integrationTest: npm run test:integration
+  build: npm run build
+
+# Start conservatively. Increase autonomy only after the repository's
+# deterministic checks and rollback procedures are trustworthy.
+autonomy:
+  createIssues: true
+  createBranches: true
+  openPullRequests: true
+  mergeToDefault: false
+  deployToStaging: false
+  deployToProduction: false
+
+verification:
+  independent: true
+  requireDifferentBackend: false
+  requireDeterministicChecks: true
+  requireUiEvidence: false
+  minimumCoveragePercent: 80
+
+budgets:
+  maxCostUsd: 15
+  maxRuntimeMinutes: 120
+  maxAgentTurns: 80
+  maxRepairCycles: 3
+
+restrictions:
+  protectedPaths:
+    - .github/
+    - infrastructure/production/
+  prohibitedActions:
+    - delete-production-data
+    - modify-billing
+    - expose-secrets
+    - weaken-branch-protection
+  allowedNetworkDomains:
+    - registry.npmjs.org
+    - github.com

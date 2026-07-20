@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sxf.dev/schemas/project.schema.json",
+  "title": "SXF Connected Project Manifest",
+  "description": "Repository-owned configuration consumed by the Software Xecution Factory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "project", "commands", "autonomy", "verification", "budgets"],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "0.1"
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "description", "status"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1},
+        "status": {"enum": ["greenfield", "existing"]},
+        "documentationRoot": {"type": "string", "default": "docs"}
+      }
+    },
+    "commands": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "minLength": 1},
+      "required": ["install", "test"],
+      "properties": {
+        "install": {"type": "string", "minLength": 1},
+        "lint": {"type": "string"},
+        "typecheck": {"type": "string"},
+        "test": {"type": "string", "minLength": 1},
+        "integrationTest": {"type": "string"},
+        "build": {"type": "string"},
+        "start": {"type": "string"}
+      }
+    },
+    "autonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["createBranches", "openPullRequests", "mergeToDefault", "deployToProduction"],
+      "properties": {
+        "createIssues": {"type": "boolean", "default": true},
+        "createBranches": {"type": "boolean"},
+        "openPullRequests": {"type": "boolean"},
+        "mergeToDefault": {"type": "boolean"},
+        "deployToStaging": {"type": "boolean", "default": false},
+        "deployToProduction": {"type": "boolean"}
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["independent", "requireDeterministicChecks"],
+      "properties": {
+        "independent": {"type": "boolean"},
+        "requireDifferentBackend": {"type": "boolean", "default": false},
+        "requireDeterministicChecks": {"type": "boolean"},
+        "requireUiEvidence": {"type": "boolean", "default": false},
+        "minimumCoveragePercent": {"type": "number", "minimum": 0, "maximum": 100}
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxCostUsd", "maxRuntimeMinutes", "maxRepairCycles"],
+      "properties": {
+        "maxCostUsd": {"type": "number", "exclusiveMinimum": 0},
+        "maxRuntimeMinutes": {"type": "integer", "minimum": 1},
+        "maxAgentTurns": {"type": "integer", "minimum": 1},
+        "maxRepairCycles": {"type": "integer", "minimum": 0}
+      }
+    },
+    "restrictions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protectedPaths": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "prohibitedActions": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "allowedNetworkDomains": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}
