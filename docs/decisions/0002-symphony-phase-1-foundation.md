@@ -1,6 +1,6 @@
 # ADR 0002: Fork and harden Symphony as the Phase 1 foundation
 
-- **Status:** Proposed
+- **Status:** Accepted (merged in [PR #9](https://github.com/kool1160/sxf-core/pull/9))
 - **Date:** 2026-07-20
 - **Issue:** [#1 — M1: Adopt Symphony as the SXF foundation](https://github.com/kool1160/sxf-core/issues/1)
 - **Upstream evaluated:** [`openai/symphony@633eae740f807de18007f5a9a25e2e0d206afdf4`](https://github.com/openai/symphony/tree/633eae740f807de18007f5a9a25e2e0d206afdf4)

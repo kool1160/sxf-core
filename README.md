@@ -53,6 +53,26 @@ Idea / Specification / GitHub Issue
 
 ## Repository status
 
-SXF is in the foundation and architecture phase. The initial repository structure defines the product boundaries, operating principles, and implementation roadmap before framework-specific code is introduced.
+SXF is implementing its Phase 1 durable core. The repository now contains the initial Elixir/OTP,
+Ecto, and SQLite WAL task domain: stable identities, an explicit lifecycle, transactional transition
+history, attempts, budgets, retries, leases, blockers, decisions, and evidence references. It does
+not yet contain the Symphony scheduler integration, GitHub integration, agent execution, workspace
+runtime, or evidence byte store.
 
-See [`AGENTS.md`](AGENTS.md) for repository guidance and [`docs/`](docs/) for the product, architecture, reliability, security, and roadmap documents.
+See [`AGENTS.md`](AGENTS.md) for repository guidance, [`docs/TASK_DOMAIN.md`](docs/TASK_DOMAIN.md)
+for the durable lifecycle contract, and [`docs/`](docs/) for the broader product, architecture,
+reliability, security, and roadmap documents.
+
+## Durable-core checks
+
+The current application requires Erlang/OTP 28 and Elixir 1.19. From the repository root:
+
+```text
+mix deps.get
+mix format --check-formatted
+MIX_ENV=test mix compile --warnings-as-errors
+mix test
+```
+
+`mix test` creates and migrates the ignored test database. Production requires an explicit
+`SXF_DATABASE_PATH`.
