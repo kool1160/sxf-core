@@ -2,13 +2,24 @@ defmodule Sxf.Execution.Claim do
   @moduledoc "A durable, fenced execution claim loaded from the task ledger."
 
   @enforce_keys [:task, :attempt, :lease, :budgets]
-  defstruct [:task, :attempt, :lease, :budgets]
+  defstruct [
+    :task,
+    :attempt,
+    :lease,
+    :budgets,
+    :runtime_deadline_at,
+    renewal_sequence: 0,
+    replayed?: false
+  ]
 
   @type t :: %__MODULE__{
           task: term(),
           attempt: term(),
           lease: term(),
-          budgets: [term()]
+          budgets: [term()],
+          runtime_deadline_at: DateTime.t() | nil,
+          renewal_sequence: non_neg_integer(),
+          replayed?: boolean()
         }
 end
 
@@ -76,6 +87,7 @@ defmodule Sxf.Execution.TaskStore do
   @callback claim_next(map()) :: {:ok, Claim.t() | nil} | {:error, term()}
   @callback renew_lease(Claim.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback record_event(Claim.t(), Event.t(), map()) :: {:ok, map()} | {:error, term()}
+  @callback enforce_runtime_timeout(Claim.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback finish(Claim.t(), atom(), map()) :: {:ok, map()} | {:error, term()}
   @callback active_claims(String.t()) :: [Claim.t()]
   @callback interrupt(Claim.t(), map()) :: {:ok, map()} | {:error, term()}
@@ -97,7 +109,12 @@ defmodule Sxf.Execution.AgentBackend do
 end
 
 defmodule Sxf.Execution.WorkspaceBackend do
-  @moduledoc "Provider-neutral workspace lifecycle contract."
+  @moduledoc """
+  Provider-neutral workspace lifecycle contract.
+
+  Prepared references and release operations must be scoped to the context's attempt and fencing
+  token so cleanup from an older attempt cannot remove a newer attempt's resources.
+  """
 
   alias Sxf.Execution.Context
 
@@ -107,7 +124,12 @@ defmodule Sxf.Execution.WorkspaceBackend do
 end
 
 defmodule Sxf.Execution.SandboxBackend do
-  @moduledoc "Provider-neutral sandbox lifecycle contract."
+  @moduledoc """
+  Provider-neutral sandbox lifecycle contract.
+
+  Prepared references and release operations must be scoped to the context's attempt and fencing
+  token so cleanup from an older attempt cannot terminate a newer attempt's sandbox.
+  """
 
   alias Sxf.Execution.Context
 

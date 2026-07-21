@@ -36,7 +36,15 @@ defmodule Sxf.Execution.TaskStore.Ecto do
              :idempotency_key
            ]),
          :ok <- validate_claim_times(attrs) do
-      request_fingerprint = fingerprint(Map.put(attrs, :command, :claim_next))
+      request_fingerprint =
+        fingerprint(%{
+          command: :claim_next,
+          worker_id: attrs.worker_id,
+          actor_id: attrs.actor_id,
+          backend: attrs.backend,
+          idempotency_key: attrs.idempotency_key,
+          dispatch_input: Map.get(attrs, :dispatch_input, %{})
+        })
 
       Repo.transaction(fn ->
         case existing_claim(attrs.idempotency_key) do
@@ -52,6 +60,8 @@ defmodule Sxf.Execution.TaskStore.Ecto do
   def renew_lease(%Claim{} = claim, attrs) when is_map(attrs) do
     with :ok <- require_keys(attrs, [:renewed_at, :expires_at, :idempotency_key]),
          :ok <- validate_renewal_times(attrs) do
+      sequence = Map.get(attrs, :sequence, claim.renewal_sequence + 1)
+
       request_fingerprint =
         fingerprint(%{
           command: :renew_lease,
@@ -59,6 +69,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
           attempt_id: claim.attempt.id,
           lease_id: claim.lease.id,
           fencing_token: claim.lease.fencing_token,
+          sequence: sequence,
           renewed_at: attrs.renewed_at,
           expires_at: attrs.expires_at,
           idempotency_key: attrs.idempotency_key
@@ -89,6 +100,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
                 attempt_id: lease.attempt_id,
                 lease_id: lease.id,
                 fencing_token: lease.fencing_token,
+                sequence: sequence,
                 renewed_at: attrs.renewed_at,
                 expires_at: attrs.expires_at,
                 idempotency_key: attrs.idempotency_key,
@@ -113,8 +125,62 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
   @impl true
   def record_event(%Claim{} = claim, %Event{} = event, attrs) when is_map(attrs) do
-    with :ok <- require_keys(attrs, [:actor_id, :correlation_id]) do
+    with :ok <- require_keys(attrs, [:actor_id, :correlation_id, :observed_at]) do
       Repo.transaction(fn -> do_record_event(claim, event, attrs) end)
+      |> flatten()
+    end
+  end
+
+  @impl true
+  def enforce_runtime_timeout(%Claim{} = claim, attrs) when is_map(attrs) do
+    required = [
+      :actor_id,
+      :observed_at,
+      :correlation_id,
+      :idempotency_key,
+      :reason,
+      :cancellation,
+      :cleanup_errors
+    ]
+
+    with :ok <- require_keys(attrs, required),
+         %DateTime{} = deadline <- claim.runtime_deadline_at || {:error, :runtime_unbounded},
+         true <-
+           DateTime.compare(attrs.observed_at, deadline) != :lt ||
+             {:error, :runtime_deadline_not_reached} do
+      Repo.transaction(fn ->
+        remaining = runtime_remaining(claim)
+
+        timeout_event = %Event{
+          id: deterministic_uuid("#{attrs.idempotency_key}:usage"),
+          idempotency_key: "#{attrs.idempotency_key}:usage",
+          sequence: claim.attempt.execution_event_sequence + 1,
+          kind: :usage,
+          occurred_at: deadline,
+          payload: %{source: "control_plane_runtime_deadline"},
+          usage: %{runtime_ms: remaining}
+        }
+
+        do_record_event(claim, timeout_event, %{
+          actor_id: attrs.actor_id,
+          correlation_id: attrs.correlation_id,
+          observed_at: attrs.observed_at
+        })
+
+        do_finish(claim, :timeout, %{
+          actor_id: attrs.actor_id,
+          occurred_at: attrs.observed_at,
+          correlation_id: attrs.correlation_id,
+          idempotency_key: attrs.idempotency_key,
+          reason: attrs.reason,
+          metadata: %{
+            timeout_source: "control_plane",
+            runtime_deadline_at: deadline,
+            cancellation: attrs.cancellation,
+            cleanup_errors: attrs.cleanup_errors
+          }
+        })
+      end)
       |> flatten()
     end
   end
@@ -258,7 +324,9 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     })
     |> update!()
 
-    claim_task(task, retry, attrs, request_fingerprint)
+    claim = claim_task(task, retry, attrs, request_fingerprint)
+    exhaust_fired_retry_budgets(retry.id)
+    %{claim | budgets: budgets_for(task.id, claim.attempt.id)}
   end
 
   defp claim_task(task, retry, attrs, request_fingerprint) do
@@ -321,13 +389,16 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       task: implementing,
       attempt: attempt,
       lease: lease,
-      budgets: budgets_for(task.id, attempt.id)
+      budgets: budgets_for(task.id, attempt.id),
+      runtime_deadline_at: runtime_deadline(task.id, attempt),
+      renewal_sequence: 0,
+      replayed?: false
     }
   end
 
   defp replay_claim(lease, request_fingerprint) do
     if lease.request_fingerprint == request_fingerprint do
-      load_claim(lease)
+      %{load_claim(lease) | replayed?: true}
     else
       Repo.rollback(:idempotency_conflict)
     end
@@ -342,11 +413,20 @@ defmodule Sxf.Execution.TaskStore.Ecto do
   defp load_claim(lease) do
     attempt = Repo.get!(TaskAttempt, lease.attempt_id)
 
+    budgets = budgets_for(lease.task_id, attempt.id)
+
     %Claim{
       task: Repo.get!(Task, lease.task_id),
       attempt: attempt,
       lease: lease,
-      budgets: budgets_for(lease.task_id, attempt.id)
+      budgets: budgets,
+      runtime_deadline_at: runtime_deadline(lease.task_id, attempt),
+      renewal_sequence:
+        Repo.aggregate(
+          from(renewal in LeaseRenewal, where: renewal.lease_id == ^lease.id),
+          :count
+        ),
+      replayed?: false
     }
   end
 
@@ -356,13 +436,18 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
     case Repo.get_by(ExecutionEvent, task_id: claim.task.id, idempotency_key: idempotency_key) do
       %ExecutionEvent{request_fingerprint: ^request_fingerprint} = persisted ->
-        %{event: persisted, idempotent?: true, exhausted_metrics: []}
+        %{
+          event: persisted,
+          attempt: Repo.get!(TaskAttempt, claim.attempt.id),
+          idempotent?: true,
+          exhausted_metrics: []
+        }
 
       %ExecutionEvent{} ->
         Repo.rollback(:idempotency_conflict)
 
       nil ->
-        lease = validate_active_lease!(claim, event.occurred_at)
+        lease = validate_active_lease!(claim, attrs.observed_at)
         attempt = Repo.get!(TaskAttempt, claim.attempt.id)
 
         if attempt.status != "running" do
@@ -394,15 +479,22 @@ defmodule Sxf.Execution.TaskStore.Ecto do
           })
           |> insert!()
 
-        attempt
-        |> TaskAttempt.event_changeset(%{
-          execution_event_sequence: event.sequence,
-          backend_session_id: event.session_id || attempt.backend_session_id
-        })
-        |> update!()
+        attempt =
+          attempt
+          |> TaskAttempt.event_changeset(%{
+            execution_event_sequence: event.sequence,
+            backend_session_id: event.session_id || attempt.backend_session_id
+          })
+          |> update!()
 
         exhausted_metrics = persist_usage(claim, event, attrs)
-        %{event: persisted, idempotent?: false, exhausted_metrics: exhausted_metrics}
+
+        %{
+          event: persisted,
+          attempt: attempt,
+          idempotent?: false,
+          exhausted_metrics: exhausted_metrics
+        }
     end
   end
 
@@ -496,7 +588,11 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       correlation_id: attrs.correlation_id,
       idempotency_key: attrs.idempotency_key,
       request_fingerprint: request_fingerprint,
-      payload: %{outcome: Atom.to_string(outcome), reason: attrs.reason}
+      payload:
+        Map.merge(
+          %{outcome: Atom.to_string(outcome), reason: attrs.reason},
+          Map.get(attrs, :metadata, %{})
+        )
     })
     |> insert!()
 
@@ -559,31 +655,27 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
   defp maybe_schedule_retry(task, attempt, outcome, attrs)
        when outcome in [:backend_unavailable, :interrupted] do
-    sequence =
-      (Repo.one(
-         from retry in RetrySchedule,
-           where: retry.task_id == ^task.id,
-           select: max(retry.sequence)
-       ) || 0) + 1
+    blockers =
+      Repo.all(
+        from blocker in Blocker,
+          where: blocker.task_id == ^task.id and blocker.status == "active"
+      )
 
-    available? = metric_available?(task.id, attempt.id, "provider_retries")
-    status = if available?, do: "scheduled", else: "exhausted"
-    delay_seconds = min(trunc(:math.pow(2, sequence - 1)) * 10, 300)
-
-    {:ok, _} =
-      Tasks.schedule_retry(%{
-        task_id: task.id,
-        attempt_id: attempt.id,
-        sequence: sequence,
-        status: status,
-        due_at: DateTime.add(attrs.occurred_at, delay_seconds, :second),
-        reason: attrs.reason,
-        resume_state: task.resume_state || task.state,
-        correlation_id: attrs.correlation_id,
-        idempotency_key: "#{attrs.idempotency_key}:retry",
-        finished_at: if(status == "exhausted", do: attrs.occurred_at),
-        metadata: %{backoff_seconds: delay_seconds, outcome: Atom.to_string(outcome)}
-      })
+    if blockers != [] and Enum.all?(blockers, &(&1.kind in @auto_resolvable_blockers)) do
+      {:ok, _} =
+        Tasks.schedule_provider_retry(%{
+          task_id: task.id,
+          attempt_id: attempt.id,
+          actor_id: attrs.actor_id,
+          occurred_at: attrs.occurred_at,
+          reason: attrs.reason,
+          resume_state: task.resume_state || task.state,
+          correlation_id: attrs.correlation_id,
+          idempotency_key: "#{attrs.idempotency_key}:retry",
+          outcome: outcome,
+          metadata: %{completion_idempotency_key: attrs.idempotency_key}
+        })
+    end
 
     :ok
   end
@@ -649,16 +741,6 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       end)
   end
 
-  defp metric_available?(task_id, attempt_id, metric) do
-    budgets_for(task_id, attempt_id)
-    |> Enum.any?(fn budget ->
-      case limit_for(budget, metric) do
-        nil -> false
-        limit -> budget.status == "active" and usage_total(budget.id, metric) < limit
-      end
-    end)
-  end
-
   defp usage_total(budget_id, metric) do
     Repo.one(
       from usage in UsageEntry,
@@ -667,11 +749,55 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     )
   end
 
+  defp exhaust_fired_retry_budgets(retry_id) do
+    UsageEntry
+    |> where([usage], usage.metric == "provider_retries")
+    |> Repo.all()
+    |> Enum.filter(&(&1.metadata["retry_schedule_id"] == retry_id))
+    |> Enum.each(fn usage ->
+      budget = Repo.get!(Budget, usage.budget_id)
+
+      if budget.status == "active" and is_integer(budget.max_provider_retries) and
+           usage_total(budget.id, "provider_retries") >= budget.max_provider_retries do
+        budget
+        |> Budget.changeset(%{status: "exhausted"})
+        |> update!()
+      end
+    end)
+  end
+
   defp limit_for(budget, "cost_microusd"), do: budget.max_cost_microusd
   defp limit_for(budget, "runtime_ms"), do: budget.max_runtime_ms
   defp limit_for(budget, "agent_turns"), do: budget.max_agent_turns
   defp limit_for(budget, "repair_cycles"), do: budget.max_repair_cycles
   defp limit_for(budget, "provider_retries"), do: budget.max_provider_retries
+
+  defp runtime_deadline(task_id, attempt) do
+    remaining =
+      budgets_for(task_id, attempt.id)
+      |> Enum.flat_map(fn budget ->
+        case budget.max_runtime_ms do
+          nil -> []
+          limit -> [max(limit - usage_total(budget.id, "runtime_ms"), 0)]
+        end
+      end)
+
+    case remaining do
+      [] -> nil
+      values -> DateTime.add(attempt.started_at, Enum.min(values), :millisecond)
+    end
+  end
+
+  defp runtime_remaining(claim) do
+    claim.budgets
+    |> Enum.flat_map(fn budget ->
+      case budget.max_runtime_ms do
+        nil -> []
+        limit -> [max(limit - usage_total(budget.id, "runtime_ms"), 0)]
+      end
+    end)
+    |> Enum.min(fn -> 0 end)
+  end
 
   defp validate_usage!(usage) when is_map(usage) do
     valid_metrics = MapSet.new(UsageEntry.metrics())
@@ -736,7 +862,8 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       occurred_at: attrs.occurred_at,
       correlation_id: attrs.correlation_id,
       idempotency_key: attrs.idempotency_key,
-      reason: attrs.reason
+      reason: attrs.reason,
+      metadata: Map.get(attrs, :metadata, %{})
     })
   end
 

@@ -46,8 +46,8 @@ session IDs are opaque strings attached to stable SXF IDs; they never become pri
 | `usage_entries` | Append-oriented, idempotent increments against one budget. |
 | `retry_schedules` | Wall-clock `due_at`, sequence, reason, resume state, and durable status. |
 | `worker_leases` | Worker claim, expiry/heartbeat, and monotonically increasing fencing token. |
-| `lease_renewals` | Append-only fingerprinted lease extensions; each extension must move expiry forward. |
-| `execution_events` | Append-only structured backend facts with attempt-local sequence, lease fencing token, actor, correlation, idempotency fingerprint, and payload. |
+| `lease_renewals` | Append-only fingerprinted lease extensions with a monotonic per-lease sequence; each extension must move expiry forward. |
+| `execution_events` | Append-only structured backend facts with attempt-local sequence, lease fencing token, actor, correlation, backend occurrence time, idempotency fingerprint, and payload. Lease authority is checked at trusted control-plane observation time. |
 | `blockers` | Active/resolved stop reason and the state to resume after resolution. |
 | `human_decisions` | Explicit approval, rejection, unblock, cancellation, reopen, deploy, or budget-override decision scoped to one identified transition or blocker-resolution action. |
 | `external_event_inbox_references` | Unique external delivery reference and payload hash for future idempotent intake. |
@@ -70,8 +70,10 @@ task.
 
 `task_attempts.execution_event_sequence` is the durable projection version for backend events.
 Accepting an event and incrementing that projection happen in one transaction. The next event must
-be exactly one greater. Its lease must be active and unexpired, its fencing token must be the newest
-token for the task, and its attempt must still be running. Exact replay returns the original row;
+be exactly one greater. Its lease must be active and unexpired at the control plane's trusted
+`observed_at`, its fencing token must be the newest token for the task, and its attempt must still
+be running. The backend's claimed `occurred_at` is retained as a fact but cannot backdate lease
+authority. Exact replay returns the original row;
 reuse with any different accepted input conflicts. See
 [`EXECUTION_COORDINATOR.md`](EXECUTION_COORDINATOR.md).
 
@@ -158,8 +160,15 @@ happy-path states are illegal.
   running attempt becomes `lost`, the task becomes `BLOCKED`, and a bounded retry row is scheduled.
   Retry backoff starts at 10 seconds, doubles by sequence, applies deterministic task-derived jitter
   of up to 20 percent, and caps at 300 seconds.
-- If provider-retry capacity is unavailable, the retry row is retained as `exhausted`; the system
-  does not loop or convert the unknown attempt into success.
+- The initial attempt does not consume provider-retry capacity. Each retry after backend
+  unavailability, session interruption, or lease expiry is reserved once in the same transaction
+  that creates its retry row. A limit of N permits exactly N retry attempts after the initial
+  attempt. Exact recovery replay does not reserve twice. If capacity is unavailable, the retry row
+  is retained as `exhausted`; the system does not loop or convert the unknown attempt into success.
+- Active executions receive durable, sequenced lease renewals independently of backend heartbeat.
+  A control-plane runtime deadline is derived from durable attempt timing and the tightest runtime
+  ceiling. Reaching it records runtime usage and the runtime blocker atomically with attempt and
+  lease finalization; a backend-declared timeout remains a separate backend outcome.
 - `restart_snapshot/1` derives nonterminal tasks, due retries, stale leases, and due pending/unknown
   outbox actions from SQLite only. Scheduler memory may be discarded without losing authority.
 
@@ -176,6 +185,11 @@ human decisions persist their request fingerprint beside the idempotency key. Re
 keys and fingerprints from durable identities such as a lease ID. Budget, inbox, outbox, and lease
 records reserve stable keys or natural unique scopes for their future command handlers. Unknown
 outbox state remains `unknown` until observed; it is never inferred to be successful.
+
+Dispatch-command fingerprints cover accepted semantic input but deliberately exclude fresh
+control-plane observation times, calculated lease expiries, and generated correlation IDs. An
+exact dispatch replay returns the durable claim without repeating external preparation or agent
+execution. Changed accepted dispatch input conflicts.
 
 ## Evidence rules
 

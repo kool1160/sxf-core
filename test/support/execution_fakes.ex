@@ -7,8 +7,14 @@ defmodule Sxf.ExecutionFakes.Workspace do
     notify(context, :workspace_prepare)
 
     case context.options[:workspace] do
-      :unavailable -> {:error, :unavailable}
-      _ -> {:ok, %{id: "workspace-#{context.claim.task.id}"}}
+      :unavailable ->
+        {:error, :unavailable}
+
+      _ ->
+        {:ok,
+         %{
+           id: "workspace-#{context.claim.attempt.id}-#{context.claim.lease.fencing_token}"
+         }}
     end
   end
 
@@ -18,7 +24,11 @@ defmodule Sxf.ExecutionFakes.Workspace do
   @impl true
   def release(context) do
     notify(context, :workspace_release)
-    :ok
+
+    case context.options[:workspace_release] do
+      :error -> {:error, :workspace_cleanup_failed}
+      _ -> :ok
+    end
   end
 
   defp notify(context, message) do
@@ -46,7 +56,11 @@ defmodule Sxf.ExecutionFakes.Sandbox do
   @impl true
   def release(context) do
     notify(context, :sandbox_release)
-    :ok
+
+    case context.options[:sandbox_release] do
+      :error -> {:error, :sandbox_cleanup_failed}
+      _ -> :ok
+    end
   end
 
   defp notify(context, message) do
@@ -73,7 +87,7 @@ defmodule Sxf.ExecutionFakes.Agent do
       :unavailable ->
         {:error, :unavailable}
 
-      :blocking ->
+      scenario when scenario in [:blocking, :hanging] ->
         receive do
           :continue -> run_events(context, emit, :success)
         end
@@ -90,7 +104,14 @@ defmodule Sxf.ExecutionFakes.Agent do
   def inspect(context), do: {:ok, context.options[:inspect] || :missing}
 
   @impl true
-  def cancel(_context), do: :ok
+  def cancel(context) do
+    if pid = context.options[:notify], do: send(pid, {:agent_cancelled, context.claim.attempt.id})
+
+    case context.options[:cancel] do
+      :error -> {:error, :cancel_failed}
+      _ -> :ok
+    end
+  end
 
   defp run_events(context, emit, scenario) do
     events = context.options[:events] || [default_started_event(context)]

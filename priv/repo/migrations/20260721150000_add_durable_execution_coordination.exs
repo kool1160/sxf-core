@@ -70,6 +70,7 @@ defmodule Sxf.Repo.Migrations.AddDurableExecutionCoordination do
           null: false
 
       add :fencing_token, :integer, null: false
+      add :sequence, :integer, null: false
       add :renewed_at, :utc_datetime_usec, null: false
       add :expires_at, :utc_datetime_usec, null: false
       add :idempotency_key, :string, null: false
@@ -78,6 +79,7 @@ defmodule Sxf.Repo.Migrations.AddDurableExecutionCoordination do
     end
 
     create unique_index(:lease_renewals, [:lease_id, :idempotency_key])
+    create unique_index(:lease_renewals, [:lease_id, :sequence])
     create index(:lease_renewals, [:task_id, :attempt_id, :renewed_at])
   end
 end

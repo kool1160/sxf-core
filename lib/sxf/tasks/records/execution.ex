@@ -72,6 +72,7 @@ defmodule Sxf.Tasks.LeaseRenewal do
 
   schema "lease_renewals" do
     field :fencing_token, :integer
+    field :sequence, :integer
     field :renewed_at, :utc_datetime_usec
     field :expires_at, :utc_datetime_usec
     field :idempotency_key, :string
@@ -90,6 +91,7 @@ defmodule Sxf.Tasks.LeaseRenewal do
       :attempt_id,
       :lease_id,
       :fencing_token,
+      :sequence,
       :renewed_at,
       :expires_at,
       :idempotency_key,
@@ -100,16 +102,19 @@ defmodule Sxf.Tasks.LeaseRenewal do
       :attempt_id,
       :lease_id,
       :fencing_token,
+      :sequence,
       :renewed_at,
       :expires_at,
       :idempotency_key,
       :request_fingerprint
     ])
     |> validate_number(:fencing_token, greater_than: 0)
+    |> validate_number(:sequence, greater_than: 0)
     |> validate_format(:request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:task_id)
     |> foreign_key_constraint(:attempt_id)
     |> foreign_key_constraint(:lease_id)
     |> unique_constraint([:lease_id, :idempotency_key])
+    |> unique_constraint([:lease_id, :sequence])
   end
 end

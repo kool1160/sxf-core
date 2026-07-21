@@ -8,7 +8,9 @@ defmodule Sxf.Application do
     children =
       [Sxf.Repo] ++
         if Application.get_env(:sxf_core, :execution_coordinator_enabled, false) do
-          [{Sxf.Execution.Coordinator, Application.fetch_env!(:sxf_core, :execution_coordinator)}]
+          [
+            {Sxf.Execution.Supervisor, Application.fetch_env!(:sxf_core, :execution_coordinator)}
+          ]
         else
           []
         end
