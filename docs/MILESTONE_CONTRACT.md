@@ -227,13 +227,24 @@ Do not implement:
 
 ## Current status
 
-**Active.**
+**Complete.**
+
+## Durable completion record
+
+M2 completion is evidenced by merged Issue #2 / [PR #10](https://github.com/kool1160/sxf-core/pull/10)
+and completed Issue #3 / [PR #13](https://github.com/kool1160/sxf-core/pull/13). The required
+repository CI checks passed for both changes, including formatting, dependency audit, warning-free
+compilation, and the test suite.
 
 # M3 — First Autonomous Vertical Slice
 
 ## Goal
 
 Prove one complete execution loop against one designated disposable test repository.
+
+## Status
+
+**Active.**
 
 ## Required flow
 
@@ -460,9 +471,10 @@ M1 Symphony Foundation
     COMPLETE
         ↓
 M2 Durable Core
-    ACTIVE
+    COMPLETE
         ↓
 M3 First Autonomous Vertical Slice
+    ACTIVE
         ↓
 M4 Independent Verification and Repair
         ↓

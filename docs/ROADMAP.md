@@ -6,6 +6,12 @@ The roadmap is organized around working vertical slices. SXF should prove one re
 
 [`MILESTONE_CONTRACT.md`](MILESTONE_CONTRACT.md) defines the mandatory M1 through M7 execution sequence, completion gates, prohibited work, and change-control rules. Humans and automated contributors must follow that contract before selecting, beginning, or reviewing work. This roadmap describes the intended capability progression but does not authorize skipping, combining, or reordering milestones.
 
+## Current milestone status
+
+- M1 — complete: the Symphony foundation decision is accepted and merged.
+- M2 — complete: the durable core and connected-project manifest contract are accepted and merged.
+- M3 — active: the next implementation target is [Issue #4](https://github.com/kool1160/sxf-core/issues/4), “Build the first single-repository execution vertical slice.”
+
 ## Phase 0 — Foundation
 
 - Establish product, architecture, security, reliability, and contribution contracts.
