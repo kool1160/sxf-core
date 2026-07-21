@@ -2,6 +2,7 @@ defmodule Sxf.SymphonyFoundationTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.{Tracker, Workspace}
+  alias SymphonyElixir.Config.Schema.Codex
 
   setup do
     original_workflow_path = Application.get_env(:symphony_elixir, :workflow_file_path)
@@ -44,6 +45,13 @@ defmodule Sxf.SymphonyFoundationTest do
 
     refute response["success"]
     assert response["output"] =~ "disabled or unsupported"
+  end
+
+  test "blank Codex commands remain invalid after dependency remediation" do
+    changeset = Codex.changeset(%Codex{}, %{command: ""})
+
+    refute changeset.valid?
+    assert {"can't be blank", _metadata} = changeset.errors[:command]
   end
 
   test "repository hooks cannot execute on the host by default" do

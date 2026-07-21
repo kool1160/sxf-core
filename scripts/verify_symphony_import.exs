@@ -11,6 +11,7 @@ defmodule Sxf.VerifySymphonyImport do
                   ])
   @modified_upstream_paths MapSet.new([
                              "elixir/config/config.exs",
+                             "elixir/lib/symphony_elixir/config/schema.ex",
                              "elixir/lib/symphony_elixir/tracker.ex",
                              "elixir/lib/symphony_elixir/workspace.ex",
                              "elixir/mix.exs",

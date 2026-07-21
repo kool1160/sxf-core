@@ -339,13 +339,13 @@
       "upstreamRepository": "https://github.com/openai/symphony.git"
     },
     {
-      "importedContentSha256": "9e28610ddafce7dfa2fb6650e62816f50743976018cd0fd7fa63a59c76b1e014",
-      "importedGitBlobSha": "6ebb278faca9e9e112058fb0817e6a7aa1201214",
+      "importedContentSha256": "5993c20e5872fcf9845a7db090fdcc0711ad9646dc95a36bb42666c07892d7c4",
+      "importedGitBlobSha": "b56dad174605a4fede999fce228482365dc2dbe9",
       "importedPath": "upstream/openai-symphony/elixir/lib/symphony_elixir/config/schema.ex",
       "license": "Apache-2.0",
-      "modificationNoticePresent": false,
-      "modificationNoticeRequired": false,
-      "modified": false,
+      "modificationNoticePresent": true,
+      "modificationNoticeRequired": true,
+      "modified": true,
       "pinnedCommit": "633eae740f807de18007f5a9a25e2e0d206afdf4",
       "upstreamGitBlobSha": "6ebb278faca9e9e112058fb0817e6a7aa1201214",
       "upstreamPath": "elixir/lib/symphony_elixir/config/schema.ex",

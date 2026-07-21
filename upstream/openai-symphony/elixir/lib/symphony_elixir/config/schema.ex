@@ -1,3 +1,8 @@
+# SXF MODIFICATION NOTICE
+# Modified from openai/symphony@633eae740f807de18007f5a9a25e2e0d206afdf4,
+# original path elixir/lib/symphony_elixir/config/schema.ex. SXF preserves rejection of blank Codex
+# commands across the remediated Ecto dependency update. This file remains Apache-2.0 licensed.
+
 defmodule SymphonyElixir.Config.Schema do
   @moduledoc false
 
@@ -215,7 +220,7 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_required([:command])
       |> validate_change(:command, fn :command, command ->
-        if command != "" and String.trim(command) == "" do
+        if String.trim(command) == "" do
           [command: "can't be blank"]
         else
           []
