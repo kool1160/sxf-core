@@ -205,10 +205,11 @@ derivative must, at minimum:
 - mark modified upstream files prominently.
 
 The license does not grant trademark rights beyond customary origin attribution, and its patent
-grant contains a patent-litigation termination provision. SXF currently has no repository-root
-license or NOTICE file. Importing upstream code is therefore blocked until SXF's own licensing
-policy and the placement of Apache notices are decided. This ADR is technical guidance, not legal
-advice; release packaging should receive license review.
+grant contains a patent-litigation termination provision. ADR 0004 records SXF's proprietary-code
+notice, the exact Apache and Symphony NOTICE material, pinned provenance, and modified-file
+marking requirements. Importing upstream source remains blocked until a dedicated source-import
+pull request applies those requirements. These ADRs are technical guidance, not legal advice;
+release packaging should receive legal review.
 
 ## Evidence collected
 
@@ -529,8 +530,8 @@ Phase 1 requirement so persistence does not encode Codex-specific session semant
 - Existing locked dependencies have current advisories and must be upgraded without weakening the
   test baseline.
 - Linux containers become a Phase 1 platform requirement; native Windows support is deferred.
-- SXF has no current top-level license/NOTICE, so upstream source import cannot begin until the
-  licensing decision is made.
+- Imported Symphony code must retain the Apache 2.0 and NOTICE obligations recorded in ADR 0004;
+  a dedicated import review must verify provenance and modified-file notices.
 - Content-addressed local evidence needs backup and corruption-recovery procedures before it can be
   considered durable beyond one host.
 
@@ -545,18 +546,19 @@ Phase 1 requirement so persistence does not encode Codex-specific session semant
 - GitHub Projects field mapping and richer operator-facing status mirroring.
 - Dashboard and observability vendor choices.
 - Native Windows execution support.
-- Public SXF licensing terms, subject to preserving Apache 2.0 obligations for imported code.
+- Formal commercial distribution review, including the proprietary SXF notice and Apache 2.0
+  obligations for imported code.
 
 ## Remaining open questions
 
-1. Which disposable GitHub repository will be used for the real GitHub/Codex end-to-end gate?
-2. Will SXF be distributed under Apache 2.0 or another compatible top-level license, and where will
-   upstream NOTICE/change markers be surfaced?
-3. Which container runtime is the supported Phase 1 default, and how will default-deny networking
-   be enforced consistently in local development and CI?
-4. What backup/restore objective is required for the Phase 1 SQLite database and local evidence
+ADR 0004 resolves the proprietary licensing boundary, Symphony attribution/provenance structure,
+Windows development route, Linux worker boundary, disposable M3 repository, GitHub App scope, and
+demonstration limits. The external Docker and GitHub App setup remains operator-controlled and must
+be verified before the live M3 demonstration.
+
+1. What backup/restore objective is required for the Phase 1 SQLite database and local evidence
    store?
-5. Which upstream dependency versions clear the recorded advisories while preserving the passing
+2. Which upstream dependency versions clear the recorded advisories while preserving the passing
    Linux conformance suite?
 
 These questions affect implementation and release readiness, but they do not prevent selecting the
