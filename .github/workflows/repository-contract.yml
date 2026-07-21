@@ -80,7 +80,7 @@ jobs:
           restore-keys: ${{ runner.os }}-mix-
 
       - name: Install dependencies
-        run: mix deps.get --only test
+        run: mix deps.get
 
       - name: Verify Symphony import provenance and licensing
         env:
@@ -129,7 +129,7 @@ jobs:
           restore-keys: ${{ runner.os }}-symphony-mix-
 
       - name: Install imported dependencies
-        run: mix deps.get --only test
+        run: mix deps.get
 
       - name: Audit imported dependencies
         run: mix hex.audit
