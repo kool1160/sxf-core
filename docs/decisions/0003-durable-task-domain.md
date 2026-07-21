@@ -1,6 +1,6 @@
 # ADR 0003: Use an append-oriented durable task ledger with transactional projections
 
-- **Status:** Proposed
+- **Status:** Accepted (merged in [PR #10](https://github.com/kool1160/sxf-core/pull/10))
 - **Date:** 2026-07-20
 - **Issue:** [#2 — M2: Define the durable task domain model](https://github.com/kool1160/sxf-core/issues/2)
 

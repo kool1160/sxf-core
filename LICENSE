@@ -1,0 +1,12 @@
+Copyright (c) 2026 Christopher Hilton
+
+Original SXF code is proprietary. All rights are reserved.
+
+No license is granted to copy, modify, distribute, sublicense, or sell original SXF code except
+through an explicit written agreement with Christopher Hilton.
+
+Third-party components retain their original licenses. This proprietary notice does not relicense
+Apache-2.0 Symphony-derived code; see `licenses/Apache-2.0.txt`,
+`licenses/symphony-NOTICE.txt`, and ADR 0004 for the applicable upstream material and provenance.
+
+Formal commercial distribution of SXF should receive legal review.
