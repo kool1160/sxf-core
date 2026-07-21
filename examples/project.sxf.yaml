@@ -14,8 +14,8 @@ commands:
   integrationTest: npm run test:integration
   build: npm run build
 
-# Start conservatively. Increase autonomy only after the repository's
-# deterministic checks and rollback procedures are trustworthy.
+# These values request autonomy; they do not grant it. SXF intersects every
+# request with the platform-owned authority ceiling, which defaults to deny.
 autonomy:
   createIssues: true
   createBranches: true

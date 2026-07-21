@@ -118,7 +118,12 @@ Shows projects, active tasks, state, budgets, failures, evidence, required decis
 
 ## Project manifest
 
-Each connected repository provides a versioned manifest validated by `schemas/project.schema.json`. It declares commands, autonomy policy, verification requirements, budgets, protected paths, and prohibited actions.
+Each connected repository provides a versioned manifest validated by `schemas/project.schema.json`.
+It declares commands, requested autonomy, verification requirements, budgets, protected paths, and
+prohibited actions. [`PROJECT_MANIFEST.md`](PROJECT_MANIFEST.md) defines pure YAML/JSON loading,
+normalization, actionable failures, and platform-policy precedence. Repository autonomy and network
+requests are intersected with a platform-owned ceiling; restrictions are additive and cannot weaken
+platform prohibitions.
 
 The manifest supplements rather than replaces repository documentation. Commands and policy must be explicit enough that a clean worker can reproduce them.
 

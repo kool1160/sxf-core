@@ -15,10 +15,11 @@ Read these documents before making architectural or behavioral changes:
 1. [`docs/PRODUCT.md`](docs/PRODUCT.md) — product goals, users, requirements, and non-goals.
 2. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system boundaries and component responsibilities.
 3. [`docs/TASK_DOMAIN.md`](docs/TASK_DOMAIN.md) — durable records, legal transitions, and recovery semantics.
-4. [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries and prohibited behavior.
-5. [`docs/RELIABILITY.md`](docs/RELIABILITY.md) — evidence, retries, idempotency, and failure handling.
-6. [`docs/ROADMAP.md`](docs/ROADMAP.md) — implementation sequence.
-7. [`schemas/project.schema.json`](schemas/project.schema.json) — connected-project manifest contract.
+4. [`docs/PROJECT_MANIFEST.md`](docs/PROJECT_MANIFEST.md) — connected-project loading, normalization, and policy precedence.
+5. [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries and prohibited behavior.
+6. [`docs/RELIABILITY.md`](docs/RELIABILITY.md) — evidence, retries, idempotency, and failure handling.
+7. [`docs/ROADMAP.md`](docs/ROADMAP.md) — implementation sequence.
+8. [`schemas/project.schema.json`](schemas/project.schema.json) — connected-project manifest contract.
 
 When documents conflict, stop and surface the conflict rather than silently choosing the easiest interpretation.
 

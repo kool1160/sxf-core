@@ -55,13 +55,16 @@ Idea / Specification / GitHub Issue
 
 SXF is implementing its Phase 1 durable core. The repository now contains the initial Elixir/OTP,
 Ecto, and SQLite WAL task domain: stable identities, an explicit lifecycle, transactional transition
-history, attempts, budgets, retries, leases, blockers, decisions, and evidence references. It does
-not yet contain the Symphony scheduler integration, GitHub integration, agent execution, workspace
-runtime, or evidence byte store.
+history, attempts, budgets, retries, leases, blockers, decisions, and evidence references. It also
+loads, strictly validates, normalizes, and applies platform policy ceilings to version `0.1` YAML or
+JSON connected-project manifests without executing their commands. It does not yet contain the
+Symphony scheduler integration, GitHub integration, agent execution, workspace runtime, or evidence
+byte store.
 
 See [`AGENTS.md`](AGENTS.md) for repository guidance, [`docs/TASK_DOMAIN.md`](docs/TASK_DOMAIN.md)
-for the durable lifecycle contract, and [`docs/`](docs/) for the broader product, architecture,
-reliability, security, and roadmap documents.
+for the durable lifecycle contract, [`docs/PROJECT_MANIFEST.md`](docs/PROJECT_MANIFEST.md) for the
+manifest validation contract, and [`docs/`](docs/) for broader product, architecture, reliability,
+security, and roadmap documents.
 
 ## Durable-core checks
 

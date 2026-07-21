@@ -27,7 +27,9 @@ defmodule SxfCore.MixProject do
     [
       {:ecto_sql, "~> 3.14"},
       {:ecto_sqlite3, "~> 0.24"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:jsonschex, "~> 0.8.1"},
+      {:yaml_elixir, "~> 2.12.2"}
     ]
   end
 
