@@ -25,6 +25,7 @@ defmodule SxfCore.MixProject do
 
   defp deps do
     [
+      {:decimal, "~> 3.1"},
       {:ecto_sql, "~> 3.14"},
       {:ecto_sqlite3, "~> 0.24"},
       {:jason, "~> 1.4"},

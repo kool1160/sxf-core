@@ -32,8 +32,10 @@ Examples: provider timeout, temporary network error, unavailable runner. Retry w
 Examples: test failure, type error, manifest validation error. Do not blindly retry the same action. Route to repair with the evidence.
 
 Connected-project manifest failures include a stable code, JSON Pointer path, and actionable
-message. Unsupported versions are rejected explicitly. YAML and JSON normalize to the same bounded
-representation, and validation has no command-execution or repository-mutation side effects.
+message. Unsupported versions and policy-ceiling violations are rejected explicitly. YAML and JSON
+decode inside time/heap boundaries and enforce nesting, node, and container limits; YAML references
+are rejected before expansion. Both formats normalize to the same bounded representation, and
+validation has no command-execution or repository-mutation side effects.
 
 ### Agent execution failure
 

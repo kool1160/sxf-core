@@ -64,7 +64,7 @@
     "budgets": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["maxCostUsd", "maxRuntimeMinutes", "maxRepairCycles"],
+      "required": ["maxCostUsd", "maxRuntimeMinutes", "maxAgentTurns", "maxRepairCycles"],
       "properties": {
         "maxCostUsd": {"type": "number", "exclusiveMinimum": 0},
         "maxRuntimeMinutes": {"type": "integer", "minimum": 1},

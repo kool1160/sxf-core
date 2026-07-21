@@ -11,6 +11,12 @@ defmodule Sxf.ProjectManifest do
 
   @supported_version "0.1"
   @max_manifest_bytes 1_048_576
+  @max_decoded_depth 64
+  @max_decoded_nodes 10_000
+  @max_decoded_containers 2_000
+  @decode_timeout_ms 5_000
+  @decode_max_heap_words 4_000_000
+  @microusd_per_usd 1_000_000
   @schema_path Path.expand("../../schemas/project.schema.json", __DIR__)
   @external_resource @schema_path
   @raw_schema @schema_path |> File.read!() |> Jason.decode!()
@@ -73,7 +79,8 @@ defmodule Sxf.ProjectManifest do
   @doc "Validates a decoded manifest and returns its policy-bounded normalized representation."
   @spec validate(term(), keyword()) :: {:ok, t()} | {:error, [Error.t()]}
   def validate(decoded, opts \\ []) do
-    with :ok <- validate_version(decoded),
+    with :ok <- validate_decoded_structure(decoded),
+         :ok <- validate_version(decoded),
          :ok <- validate_schema(decoded),
          {:ok, policy} <- platform_policy(opts),
          :ok <- validate_policy(decoded, policy) do
@@ -85,18 +92,46 @@ defmodule Sxf.ProjectManifest do
   def supported_version, do: @supported_version
 
   defp decode(content, :json) do
-    case Jason.decode(content, objects: :ordered_objects) do
-      {:ok, decoded} -> normalize_json(decoded, [])
-      {:error, error} -> parse_error(:json, Exception.message(error))
-    end
+    bounded_decode(fn -> decode_json(content) end)
   end
 
   defp decode(content, :yaml) do
+    with :ok <- reject_yaml_references(content) do
+      bounded_decode(fn -> decode_yaml(content) end)
+    end
+  end
+
+  defp decode(_content, format) do
+    {:error,
+     [
+       error(
+         :unsupported_format,
+         "/",
+         "Unsupported manifest format #{inspect(format)}; expected :yaml or :json."
+       )
+     ]}
+  end
+
+  defp decode_json(content) do
+    case Jason.decode(content, objects: :ordered_objects, floats: :decimals) do
+      {:ok, decoded} ->
+        with :ok <- validate_decoded_structure(decoded) do
+          normalize_json(decoded, [])
+        end
+
+      {:error, error} ->
+        parse_error(:json, Exception.message(error))
+    end
+  end
+
+  defp decode_yaml(content) do
     case YamlElixir.read_all_from_string(content, maps_as_keywords: true) do
       {:ok, [document]} ->
-        case yaml_duplicate_errors(document, []) do
-          [] -> decode_yaml_without_atoms(content)
-          errors -> {:error, errors}
+        with :ok <- validate_decoded_structure(document) do
+          case yaml_duplicate_errors(document, []) do
+            [] -> decode_yaml_without_atoms(content)
+            errors -> {:error, errors}
+          end
         end
 
       {:ok, documents} ->
@@ -114,23 +149,252 @@ defmodule Sxf.ProjectManifest do
     end
   end
 
-  defp decode(_content, format) do
-    {:error,
-     [
-       error(
-         :unsupported_format,
-         "/",
-         "Unsupported manifest format #{inspect(format)}; expected :yaml or :json."
-       )
-     ]}
-  end
-
   defp decode_yaml_without_atoms(content) do
     case YamlElixir.read_all_from_string(content) do
-      {:ok, [decoded]} -> {:ok, decoded}
-      {:error, error} -> parse_error(:yaml, Exception.message(error))
+      {:ok, [decoded]} ->
+        with :ok <- validate_decoded_structure(decoded),
+             {:ok, decoded} <- preserve_exact_yaml_cost(content, decoded) do
+          {:ok, decoded}
+        end
+
+      {:error, error} ->
+        parse_error(:yaml, Exception.message(error))
     end
   end
+
+  defp preserve_exact_yaml_cost(content, decoded) do
+    case YamlElixir.read_all_from_string(content, schema: :failsafe) do
+      {:ok, [raw]} ->
+        case get_in(raw, ["budgets", "maxCostUsd"]) do
+          value when is_binary(value) ->
+            try do
+              {:ok, put_in(decoded, ["budgets", "maxCostUsd"], Decimal.new(value))}
+            rescue
+              Decimal.Error -> {:ok, decoded}
+            end
+
+          _value ->
+            {:ok, decoded}
+        end
+
+      {:error, error} ->
+        parse_error(:yaml, Exception.message(error))
+    end
+  end
+
+  defp bounded_decode(decode_fun) do
+    parent = self()
+    result_ref = make_ref()
+
+    {pid, monitor_ref} =
+      :erlang.spawn_opt(
+        fn -> send(parent, {result_ref, safe_decode(decode_fun)}) end,
+        [
+          :monitor,
+          {:max_heap_size, %{size: @decode_max_heap_words, kill: true, error_logger: false}}
+        ]
+      )
+
+    receive do
+      {^result_ref, result} ->
+        Process.demonitor(monitor_ref, [:flush])
+        result
+
+      {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
+        decoded_resource_error("Manifest decoding exceeded the parser resource boundary.")
+    after
+      @decode_timeout_ms ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+        after
+          1_000 -> Process.demonitor(monitor_ref, [:flush])
+        end
+
+        decoded_resource_error(
+          "Manifest decoding exceeded the #{@decode_timeout_ms} ms time boundary."
+        )
+    end
+  end
+
+  defp safe_decode(decode_fun) do
+    decode_fun.()
+  rescue
+    exception ->
+      {:error,
+       [
+         error(
+           :parse_error,
+           "/",
+           "Manifest decoder failed safely: #{Exception.message(exception)}"
+         )
+       ]}
+  catch
+    _kind, _reason ->
+      decoded_resource_error("Manifest decoding failed inside the parser boundary.")
+  end
+
+  defp decoded_resource_error(message) do
+    {:error, [error(:decoded_structure_limit, "/", message)]}
+  end
+
+  defp validate_decoded_structure(decoded) do
+    case walk_decoded(decoded, [], 0, 0, 0) do
+      {:ok, _counts} -> :ok
+      {:error, structure_error} -> {:error, [structure_error]}
+    end
+  end
+
+  defp walk_decoded(value, path, depth, nodes, containers) do
+    nodes = nodes + 1
+
+    cond do
+      nodes > @max_decoded_nodes ->
+        {:error,
+         error(
+           :maximum_node_count,
+           pointer_from_segments(path),
+           "Decoded manifest exceeds the maximum of #{@max_decoded_nodes} nodes."
+         )}
+
+      decoded_container?(value) ->
+        walk_decoded_container(value, path, depth + 1, nodes, containers + 1)
+
+      true ->
+        {:ok, {nodes, containers}}
+    end
+  end
+
+  defp walk_decoded_container(_value, path, depth, _nodes, _containers)
+       when depth > @max_decoded_depth do
+    {:error,
+     error(
+       :maximum_nesting_depth,
+       pointer_from_segments(path),
+       "Decoded manifest exceeds the maximum nesting depth of #{@max_decoded_depth}."
+     )}
+  end
+
+  defp walk_decoded_container(_value, path, _depth, _nodes, containers)
+       when containers > @max_decoded_containers do
+    {:error,
+     error(
+       :maximum_container_count,
+       pointer_from_segments(path),
+       "Decoded manifest exceeds the maximum of #{@max_decoded_containers} containers."
+     )}
+  end
+
+  defp walk_decoded_container(value, path, depth, nodes, containers) do
+    value
+    |> decoded_children()
+    |> Enum.reduce_while({:ok, {nodes, containers}}, fn {segment, child},
+                                                        {:ok, {node_count, container_count}} ->
+      case walk_decoded(
+             child,
+             path ++ [segment],
+             depth,
+             node_count,
+             container_count
+           ) do
+        {:ok, counts} -> {:cont, {:ok, counts}}
+        {:error, structure_error} -> {:halt, {:error, structure_error}}
+      end
+    end)
+  end
+
+  defp decoded_container?(%Jason.OrderedObject{}), do: true
+  defp decoded_container?(%Decimal{}), do: false
+  defp decoded_container?(%_struct{}), do: false
+  defp decoded_container?(value), do: is_map(value) or is_list(value)
+
+  defp decoded_children(%Jason.OrderedObject{values: values}), do: values
+
+  defp decoded_children(values) when is_list(values) do
+    if values != [] and Enum.all?(values, &match?({_, _}, &1)) do
+      values
+    else
+      values |> Enum.with_index() |> Enum.map(fn {value, index} -> {index, value} end)
+    end
+  end
+
+  defp decoded_children(values) when is_map(values) do
+    values
+    |> Enum.sort_by(fn {key, _value} -> inspect(key) end)
+  end
+
+  defp reject_yaml_references(content), do: scan_yaml_references(content, :plain, nil)
+
+  defp scan_yaml_references(<<>>, _state, _previous), do: :ok
+
+  defp scan_yaml_references(<<?\n, rest::binary>>, :comment, _previous),
+    do: scan_yaml_references(rest, :plain, ?\n)
+
+  defp scan_yaml_references(<<_byte, rest::binary>>, :comment, previous),
+    do: scan_yaml_references(rest, :comment, previous)
+
+  defp scan_yaml_references(<<?', ?', rest::binary>>, :single_quote, _previous),
+    do: scan_yaml_references(rest, :single_quote, ?')
+
+  defp scan_yaml_references(<<?', rest::binary>>, :single_quote, _previous),
+    do: scan_yaml_references(rest, :plain, ?')
+
+  defp scan_yaml_references(<<byte, rest::binary>>, :single_quote, _previous),
+    do: scan_yaml_references(rest, :single_quote, byte)
+
+  defp scan_yaml_references(<<?\\, _escaped, rest::binary>>, :double_quote, _previous),
+    do: scan_yaml_references(rest, :double_quote, nil)
+
+  defp scan_yaml_references(<<?\", rest::binary>>, :double_quote, _previous),
+    do: scan_yaml_references(rest, :plain, ?\")
+
+  defp scan_yaml_references(<<byte, rest::binary>>, :double_quote, _previous),
+    do: scan_yaml_references(rest, :double_quote, byte)
+
+  defp scan_yaml_references(<<?#, rest::binary>>, :plain, previous)
+       when previous in [nil, ?\s, ?\t, ?\r, ?\n] do
+    scan_yaml_references(rest, :comment, previous)
+  end
+
+  defp scan_yaml_references(<<?', rest::binary>>, :plain, _previous),
+    do: scan_yaml_references(rest, :single_quote, ?')
+
+  defp scan_yaml_references(<<?\", rest::binary>>, :plain, _previous),
+    do: scan_yaml_references(rest, :double_quote, ?\")
+
+  defp scan_yaml_references(<<indicator, rest::binary>>, :plain, previous)
+       when indicator in [?&, ?*] do
+    if yaml_reference_indicator?(previous, rest) do
+      {:error,
+       [
+         error(
+           :yaml_references_not_allowed,
+           "/",
+           "YAML anchors and aliases are not allowed; duplicate the bounded value explicitly."
+         )
+       ]}
+    else
+      scan_yaml_references(rest, :plain, indicator)
+    end
+  end
+
+  defp scan_yaml_references(<<byte, rest::binary>>, :plain, _previous),
+    do: scan_yaml_references(rest, :plain, byte)
+
+  defp yaml_reference_indicator?(previous, <<next, _rest::binary>>) do
+    yaml_reference_boundary?(previous) and not yaml_reference_terminator?(next)
+  end
+
+  defp yaml_reference_indicator?(_previous, <<>>), do: false
+
+  defp yaml_reference_boundary?(nil), do: true
+
+  defp yaml_reference_boundary?(byte),
+    do: byte in [?\s, ?\t, ?\r, ?\n, ?[, ?{, ?,, ?:, ??, ?-]
+
+  defp yaml_reference_terminator?(byte),
+    do: byte in [?\s, ?\t, ?\r, ?\n, ?[, ?], ?{, ?}, ?,]
 
   defp normalize_json(%Jason.OrderedObject{values: values}, path) do
     duplicate_errors = duplicate_errors(values, path)
@@ -208,7 +472,7 @@ defmodule Sxf.ProjectManifest do
   defp validate_version(_decoded), do: :ok
 
   defp validate_schema(decoded) do
-    case JSONSchex.validate(@compiled_schema, decoded) do
+    case JSONSchex.validate(@compiled_schema, schema_compatible(decoded)) do
       :ok ->
         :ok
 
@@ -217,6 +481,41 @@ defmodule Sxf.ProjectManifest do
          errors
          |> Enum.map(&schema_error/1)
          |> Enum.sort_by(&{&1.path, &1.code, &1.message})}
+    end
+  end
+
+  defp schema_compatible(%Decimal{} = value), do: decimal_to_schema_float(value)
+
+  defp schema_compatible(%Jason.OrderedObject{values: values}) do
+    Map.new(values, fn {key, value} -> {key, schema_compatible(value)} end)
+  end
+
+  defp schema_compatible(%_struct{} = value), do: value
+
+  defp schema_compatible(values) when is_map(values) do
+    Map.new(values, fn {key, value} -> {key, schema_compatible(value)} end)
+  end
+
+  defp schema_compatible(values) when is_list(values), do: Enum.map(values, &schema_compatible/1)
+  defp schema_compatible(value), do: value
+
+  defp decimal_to_schema_float(value) do
+    Decimal.to_float(value)
+  rescue
+    Decimal.Error -> bounded_schema_float(value)
+    ArgumentError -> bounded_schema_float(value)
+  end
+
+  defp bounded_schema_float(value) do
+    sign = Decimal.compare(value, Decimal.new(0))
+    magnitude = Decimal.abs(value)
+
+    cond do
+      sign == :eq -> 0.0
+      Decimal.compare(magnitude, Decimal.new("1e308")) == :gt and sign == :lt -> -1.0e308
+      Decimal.compare(magnitude, Decimal.new("1e308")) == :gt -> 1.0e308
+      sign == :lt -> -2.2250738585072014e-308
+      true -> 2.2250738585072014e-308
     end
   end
 
@@ -272,23 +571,26 @@ defmodule Sxf.ProjectManifest do
       commands: select_keys(decoded["commands"], @command_keys),
       requested_autonomy: requested_autonomy,
       autonomy: effective_autonomy,
-      verification:
-        @verification_defaults
-        |> Map.merge(decoded["verification"])
-        |> select_keys(
-          ~w(independent requireDifferentBackend requireDeterministicChecks requireUiEvidence minimumCoveragePercent)
-        ),
-      budgets:
-        select_keys(
-          decoded["budgets"],
-          ~w(maxCostUsd maxRuntimeMinutes maxAgentTurns maxRepairCycles)
-        ),
+      verification: normalize_verification(decoded["verification"]),
+      budgets: normalize_budgets(decoded["budgets"]),
       restrictions: select_keys(restrictions, @restriction_keys)
     }
   end
 
   defp validate_policy(decoded, policy) do
     errors =
+      verification_policy_errors(decoded, policy) ++
+        budget_policy_errors(decoded, policy) ++
+        autonomy_policy_errors(decoded, policy) ++
+        network_policy_errors(decoded, policy)
+
+    errors = Enum.sort_by(errors, &{&1.path, &1.code, &1.message})
+
+    if errors == [], do: :ok, else: {:error, errors}
+  end
+
+  defp verification_policy_errors(decoded, policy) do
+    boolean_errors =
       policy.required_verification
       |> Enum.reject(&(decoded["verification"][&1] == true))
       |> Enum.sort()
@@ -300,26 +602,173 @@ defmodule Sxf.ProjectManifest do
         )
       end)
 
-    if errors == [], do: :ok, else: {:error, errors}
+    repository_minimum = decoded["verification"]["minimumCoveragePercent"]
+
+    coverage_errors =
+      if coverage_below_platform?(repository_minimum, policy.minimum_coverage_percent) do
+        [
+          error(
+            :platform_policy_conflict,
+            "/verification/minimumCoveragePercent",
+            "Platform policy requires minimumCoveragePercent to be at least #{policy.minimum_coverage_percent}."
+          )
+        ]
+      else
+        []
+      end
+
+    boolean_errors ++ coverage_errors
   end
+
+  defp budget_policy_errors(decoded, policy) do
+    budgets = decoded["budgets"]
+
+    [
+      cost_ceiling_error(budgets["maxCostUsd"], policy.max_cost_microusd),
+      integer_ceiling_error(
+        budgets["maxRuntimeMinutes"],
+        policy.max_runtime_minutes,
+        "/budgets/maxRuntimeMinutes",
+        "maxRuntimeMinutes"
+      ),
+      integer_ceiling_error(
+        budgets["maxAgentTurns"],
+        policy.max_agent_turns,
+        "/budgets/maxAgentTurns",
+        "maxAgentTurns"
+      ),
+      integer_ceiling_error(
+        budgets["maxRepairCycles"],
+        policy.max_repair_cycles,
+        "/budgets/maxRepairCycles",
+        "maxRepairCycles"
+      )
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp autonomy_policy_errors(decoded, policy) do
+    decoded["autonomy"]
+    |> Enum.filter(fn {action, requested?} ->
+      requested? == true and not authority_allowed?(policy, action)
+    end)
+    |> Enum.map(fn {action, _requested?} ->
+      error(
+        :platform_policy_conflict,
+        "/autonomy/#{action}",
+        "Repository requests #{action}, but platform policy does not allow it."
+      )
+    end)
+  end
+
+  defp network_policy_errors(decoded, policy) do
+    decoded
+    |> get_in(["restrictions", "allowedNetworkDomains"])
+    |> List.wrap()
+    |> Enum.with_index()
+    |> Enum.reject(fn {domain, _index} ->
+      MapSet.member?(policy.allowed_network_domains, domain)
+    end)
+    |> Enum.map(fn {domain, index} ->
+      error(
+        :platform_policy_conflict,
+        "/restrictions/allowedNetworkDomains/#{index}",
+        "Repository requests network domain #{inspect(domain)}, but it is outside the platform allowlist."
+      )
+    end)
+  end
+
+  defp cost_ceiling_error(repository_usd, ceiling_microusd) do
+    requested_microusd = Decimal.mult(to_decimal(repository_usd), @microusd_per_usd)
+
+    if Decimal.compare(requested_microusd, Decimal.new(ceiling_microusd)) == :gt do
+      error(
+        :platform_policy_conflict,
+        "/budgets/maxCostUsd",
+        "Repository maxCostUsd exceeds the platform ceiling of #{ceiling_microusd} microusd."
+      )
+    end
+  end
+
+  defp integer_ceiling_error(value, ceiling, path, name) when value > ceiling do
+    error(
+      :platform_policy_conflict,
+      path,
+      "Repository #{name} value #{value} exceeds the platform ceiling of #{ceiling}."
+    )
+  end
+
+  defp integer_ceiling_error(_value, _ceiling, _path, _name), do: nil
+
+  defp coverage_below_platform?(nil, platform_minimum), do: platform_minimum > 0
+
+  defp coverage_below_platform?(repository_minimum, platform_minimum) do
+    Decimal.compare(to_decimal(repository_minimum), to_decimal(platform_minimum)) == :lt
+  end
+
+  defp normalize_budgets(budgets) do
+    %{
+      "maxCostMicrousd" => usd_to_microusd(budgets["maxCostUsd"]),
+      "maxRuntimeMinutes" => budgets["maxRuntimeMinutes"],
+      "maxAgentTurns" => budgets["maxAgentTurns"],
+      "maxRepairCycles" => budgets["maxRepairCycles"]
+    }
+  end
+
+  defp normalize_verification(verification) do
+    verification =
+      @verification_defaults
+      |> Map.merge(verification)
+      |> select_keys(
+        ~w(independent requireDifferentBackend requireDeterministicChecks requireUiEvidence minimumCoveragePercent)
+      )
+
+    case verification["minimumCoveragePercent"] do
+      %Decimal{} = percent ->
+        Map.put(verification, "minimumCoveragePercent", Decimal.to_float(percent))
+
+      _value ->
+        verification
+    end
+  end
+
+  defp usd_to_microusd(value) do
+    value
+    |> to_decimal()
+    |> Decimal.mult(@microusd_per_usd)
+    |> Decimal.round(0, :floor)
+    |> Decimal.to_integer()
+  end
+
+  defp to_decimal(%Decimal{} = value), do: value
+  defp to_decimal(value) when is_integer(value), do: Decimal.new(value)
+  defp to_decimal(value) when is_float(value), do: Decimal.from_float(value)
 
   defp platform_policy(opts) do
     case Keyword.get(opts, :platform_policy, Policy.new()) do
       %Policy{} = policy ->
-        {:ok, Policy.enforce(policy)}
+        validate_platform_policy(Policy.enforce(policy))
 
       attrs when is_map(attrs) ->
-        {:ok, Policy.new(attrs)}
+        validate_platform_policy(Policy.new(attrs))
 
       attrs when is_list(attrs) ->
         if Keyword.keyword?(attrs) do
-          {:ok, Policy.new(attrs)}
+          validate_platform_policy(Policy.new(attrs))
         else
           {:error, [error(:invalid_platform_policy, "/", "Platform policy is invalid.")]}
         end
 
       _ ->
         {:error, [error(:invalid_platform_policy, "/", "Platform policy is invalid.")]}
+    end
+  end
+
+  defp validate_platform_policy(policy) do
+    if Policy.valid?(policy) do
+      {:ok, policy}
+    else
+      {:error, [error(:invalid_platform_policy, "/", "Platform policy is invalid.")]}
     end
   end
 
@@ -433,10 +882,15 @@ defmodule Sxf.ProjectManifest do
 
   defp escape_pointer(segment) do
     segment
-    |> to_string()
+    |> pointer_segment()
     |> String.replace("~", "~0")
     |> String.replace("/", "~1")
   end
+
+  defp pointer_segment(segment) when is_binary(segment), do: segment
+  defp pointer_segment(segment) when is_integer(segment), do: Integer.to_string(segment)
+  defp pointer_segment(segment) when is_atom(segment), do: Atom.to_string(segment)
+  defp pointer_segment(segment), do: inspect(segment)
 
   defp error(code, path, message), do: %Error{code: code, path: path, message: message}
 end

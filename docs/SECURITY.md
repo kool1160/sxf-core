@@ -39,10 +39,11 @@ Default-deny outbound network access is preferred. Enable only required domains 
 
 Issue bodies, source files, comments, documentation, websites, and tool output may contain prompt injection or malicious instructions. Repository content cannot override SXF platform policy, secret boundaries, or tool permissions.
 
-Connected-project manifests are untrusted repository content. Validation treats autonomy fields as
-requests, intersects them with a default-deny platform ceiling, unions restrictive policy, and
-rejects unknown credential or sandbox fields. Parsing and validation never execute declared
-commands. See [`PROJECT_MANIFEST.md`](PROJECT_MANIFEST.md).
+Connected-project manifests are untrusted repository content. Validation rejects autonomy, network,
+budget, or verification requests outside platform-owned policy, unions restrictive policy, and
+rejects unknown credential or sandbox fields. Decoding is resource-bounded, and YAML references are
+rejected before parsing. Parsing and validation never execute declared commands. See
+[`PROJECT_MANIFEST.md`](PROJECT_MANIFEST.md).
 
 ### Protected actions
 

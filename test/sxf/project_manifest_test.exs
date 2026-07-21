@@ -7,8 +7,9 @@ defmodule Sxf.ProjectManifestTest do
 
   @example_path Path.expand("../../examples/project.sxf.yaml", __DIR__)
 
-  test "loads and normalizes the example YAML manifest conservatively" do
-    assert {:ok, %ProjectManifest{} = manifest} = ProjectManifest.load(@example_path)
+  test "loads and normalizes the example YAML manifest within explicit platform policy" do
+    assert {:ok, %ProjectManifest{} = manifest} =
+             ProjectManifest.load(@example_path, platform_policy: example_policy())
 
     assert manifest.schema_version == "0.1"
     assert manifest.project["documentationRoot"] == "docs"
@@ -16,9 +17,40 @@ defmodule Sxf.ProjectManifestTest do
     assert manifest.commands["test"] == "npm test"
     assert manifest.requested_autonomy["createBranches"]
     assert manifest.requested_autonomy["openPullRequests"]
-    assert Enum.all?(manifest.autonomy, fn {_action, allowed?} -> allowed? == false end)
-    assert manifest.restrictions["allowedNetworkDomains"] == []
+    assert manifest.autonomy["createIssues"]
+    assert manifest.autonomy["createBranches"]
+    assert manifest.autonomy["openPullRequests"]
+
+    assert manifest.restrictions["allowedNetworkDomains"] == [
+             "github.com",
+             "registry.npmjs.org"
+           ]
+
+    assert manifest.budgets["maxCostMicrousd"] == 15_000_000
+    refute Map.has_key?(manifest.budgets, "maxCostUsd")
     assert "expose-secrets" in manifest.restrictions["prohibitedActions"]
+  end
+
+  test "the default platform policy rejects authority and network requests" do
+    assert {:error, errors} = ProjectManifest.load(@example_path)
+
+    assert_error(errors, :platform_policy_conflict, "/autonomy/createIssues")
+    assert_error(errors, :platform_policy_conflict, "/autonomy/createBranches")
+    assert_error(errors, :platform_policy_conflict, "/autonomy/openPullRequests")
+
+    assert_error(
+      errors,
+      :platform_policy_conflict,
+      "/restrictions/allowedNetworkDomains/0",
+      "registry.npmjs.org"
+    )
+
+    assert_error(
+      errors,
+      :platform_policy_conflict,
+      "/restrictions/allowedNetworkDomains/1",
+      "github.com"
+    )
   end
 
   test "loads JSON and applies stable optional defaults" do
@@ -32,7 +64,7 @@ defmodule Sxf.ProjectManifestTest do
       valid_manifest()
       |> put_in(["autonomy", "createBranches"], true)
       |> put_in(["autonomy", "openPullRequests"], true)
-      |> Map.put("restrictions", %{"allowedNetworkDomains" => ["github.com", "example.com"]})
+      |> Map.put("restrictions", %{"allowedNetworkDomains" => ["github.com"]})
 
     path = temporary_file!("project.sxf.json", Jason.encode!(manifest))
 
@@ -55,8 +87,16 @@ defmodule Sxf.ProjectManifestTest do
     yaml = File.read!(@example_path)
     {:ok, decoded} = YamlElixir.read_from_string(yaml)
 
-    assert {:ok, yaml_manifest} = ProjectManifest.load_string(yaml, :yaml)
-    assert {:ok, json_manifest} = ProjectManifest.load_string(Jason.encode!(decoded), :json)
+    assert {:ok, yaml_manifest} =
+             ProjectManifest.load_string(yaml, :yaml, platform_policy: example_policy())
+
+    assert {:ok, json_manifest} =
+             ProjectManifest.load_string(
+               Jason.encode!(decoded),
+               :json,
+               platform_policy: example_policy()
+             )
+
     assert json_manifest == yaml_manifest
   end
 
@@ -88,7 +128,10 @@ defmodule Sxf.ProjectManifestTest do
     manifest =
       valid_manifest()
       |> update_in(["commands"], &Map.drop(&1, ["install", "test"]))
-      |> update_in(["budgets"], &Map.drop(&1, ["maxCostUsd", "maxRuntimeMinutes"]))
+      |> update_in(
+        ["budgets"],
+        &Map.drop(&1, ["maxCostUsd", "maxRuntimeMinutes", "maxAgentTurns"])
+      )
       |> update_in(
         ["autonomy"],
         &Map.drop(&1, ["createBranches", "mergeToDefault", "deployToProduction"])
@@ -101,6 +144,7 @@ defmodule Sxf.ProjectManifestTest do
     assert_error(errors, :missing_required_property, "/commands", "test")
     assert_error(errors, :missing_required_property, "/budgets", "maxCostUsd")
     assert_error(errors, :missing_required_property, "/budgets", "maxRuntimeMinutes")
+    assert_error(errors, :missing_required_property, "/budgets", "maxAgentTurns")
     assert_error(errors, :missing_required_property, "/autonomy", "createBranches")
     assert_error(errors, :missing_required_property, "/autonomy", "mergeToDefault")
     assert_error(errors, :missing_required_property, "/autonomy", "deployToProduction")
@@ -156,7 +200,71 @@ defmodule Sxf.ProjectManifestTest do
              ProjectManifest.load_string(json, :json)
   end
 
-  test "repository requests cannot exceed platform authority or remove prohibitions" do
+  test "decoded nesting depth is bounded for JSON, YAML, and direct validation" do
+    deep_json = String.duplicate("[", 65) <> "0" <> String.duplicate("]", 65)
+
+    assert {:error, [%Error{code: :maximum_nesting_depth, path: path}]} =
+             ProjectManifest.load_string(deep_json, :json)
+
+    assert String.starts_with?(path, "/")
+
+    deep_yaml =
+      0..64
+      |> Enum.map_join("\n", fn depth -> String.duplicate("  ", depth) <> "level#{depth}:" end)
+      |> Kernel.<>(" value\n")
+
+    assert {:error, [%Error{code: :maximum_nesting_depth}]} =
+             ProjectManifest.load_string(deep_yaml, :yaml)
+
+    deep_term = Enum.reduce(1..65, 0, fn _index, nested -> [nested] end)
+
+    assert {:error, [%Error{code: :maximum_nesting_depth}]} =
+             ProjectManifest.validate(deep_term)
+
+    pathological_json =
+      String.duplicate("[", 100_000) <> "0" <> String.duplicate("]", 100_000)
+
+    assert {:error, [%Error{code: code, path: pathological_path}]} =
+             ProjectManifest.load_string(pathological_json, :json)
+
+    assert code in [:maximum_nesting_depth, :decoded_structure_limit]
+    assert String.starts_with?(pathological_path, "/")
+  end
+
+  test "decoded node and container counts are independently bounded" do
+    too_many_nodes = "[" <> Enum.map_join(1..10_000, ",", fn _ -> "0" end) <> "]"
+
+    assert {:error, [%Error{code: :maximum_node_count}]} =
+             ProjectManifest.load_string(too_many_nodes, :json)
+
+    too_many_containers =
+      "[" <> Enum.map_join(1..2_001, ",", fn _ -> "[]" end) <> "]"
+
+    assert {:error, [%Error{code: :maximum_container_count}]} =
+             ProjectManifest.load_string(too_many_containers, :json)
+  end
+
+  test "YAML anchors and aliases are rejected before expansion" do
+    for source <- ["value: &anchor explicit\n", "value: *alias\n"] do
+      assert {:error,
+              [
+                %Error{
+                  code: :yaml_references_not_allowed,
+                  path: "/",
+                  message: message
+                }
+              ]} = ProjectManifest.load_string(source, :yaml)
+
+      assert message =~ "anchors and aliases"
+    end
+
+    quoted = ~s(project: "literal &anchor and *alias")
+
+    assert {:error, errors} = ProjectManifest.load_string(quoted, :yaml)
+    refute Enum.any?(errors, &(&1.code == :yaml_references_not_allowed))
+  end
+
+  test "repository authority and network requests outside platform ceilings fail onboarding" do
     manifest =
       valid_manifest()
       |> Map.put(
@@ -164,14 +272,42 @@ defmodule Sxf.ProjectManifestTest do
         Map.new(Policy.autonomy_keys(), &{&1, true})
       )
       |> Map.put("restrictions", %{
-        "protectedPaths" => ["repository-owned/"],
-        "prohibitedActions" => [],
         "allowedNetworkDomains" => ["github.com", "exfiltration.invalid"]
       })
 
     policy =
       Policy.new(
-        allowed_autonomy: Policy.autonomy_keys() ++ ["notARealAuthority"],
+        allowed_autonomy: ["createIssues", "createBranches", "openPullRequests"],
+        allowed_network_domains: ["github.com"]
+      )
+
+    assert {:error, errors} = ProjectManifest.validate(manifest, platform_policy: policy)
+
+    assert_error(errors, :platform_policy_conflict, "/autonomy/mergeToDefault")
+    assert_error(errors, :platform_policy_conflict, "/autonomy/deployToStaging")
+    assert_error(errors, :platform_policy_conflict, "/autonomy/deployToProduction")
+
+    assert_error(
+      errors,
+      :platform_policy_conflict,
+      "/restrictions/allowedNetworkDomains/1",
+      "exfiltration.invalid"
+    )
+  end
+
+  test "accepted repository restrictions remain additive to mandatory platform restrictions" do
+    manifest =
+      valid_manifest()
+      |> put_in(["autonomy", "createBranches"], true)
+      |> Map.put("restrictions", %{
+        "protectedPaths" => ["repository-owned/"],
+        "prohibitedActions" => [],
+        "allowedNetworkDomains" => ["github.com"]
+      })
+
+    policy =
+      Policy.new(
+        allowed_autonomy: ["createBranches"],
         protected_paths: [".github/"],
         prohibited_actions: ["platform-only-action"],
         allowed_network_domains: ["github.com", "platform.internal"]
@@ -179,13 +315,8 @@ defmodule Sxf.ProjectManifestTest do
 
     assert {:ok, normalized} = ProjectManifest.validate(manifest, platform_policy: policy)
 
+    assert normalized.requested_autonomy["createBranches"]
     assert normalized.autonomy["createBranches"]
-
-    assert normalized.autonomy["createIssues"]
-    assert normalized.autonomy["openPullRequests"]
-    assert normalized.autonomy["mergeToDefault"]
-    assert normalized.autonomy["deployToStaging"]
-    refute normalized.autonomy["deployToProduction"]
 
     assert normalized.restrictions["protectedPaths"] == [".github/", "repository-owned/"]
     assert normalized.restrictions["allowedNetworkDomains"] == ["github.com"]
@@ -201,11 +332,12 @@ defmodule Sxf.ProjectManifestTest do
       prohibited_actions: MapSet.new()
     }
 
-    assert {:ok, still_bounded} =
-             ProjectManifest.validate(manifest, platform_policy: weakened_policy)
+    production_request = put_in(valid_manifest(), ["autonomy", "deployToProduction"], true)
 
-    refute still_bounded.autonomy["deployToProduction"]
-    assert "deploy-to-production" in still_bounded.restrictions["prohibitedActions"]
+    assert {:error, errors} =
+             ProjectManifest.validate(production_request, platform_policy: weakened_policy)
+
+    assert_error(errors, :platform_policy_conflict, "/autonomy/deployToProduction")
   end
 
   test "repository verification settings cannot weaken mandatory platform checks" do
@@ -229,6 +361,139 @@ defmodule Sxf.ProjectManifestTest do
       "/verification/requireDeterministicChecks",
       "requires requireDeterministicChecks"
     )
+  end
+
+  test "platform verification policy enforces every boolean gate and minimum coverage" do
+    weakened =
+      valid_manifest()
+      |> Map.put("verification", %{
+        "independent" => false,
+        "requireDeterministicChecks" => false,
+        "requireDifferentBackend" => false,
+        "requireUiEvidence" => false,
+        "minimumCoveragePercent" => 79.99
+      })
+
+    policy =
+      Policy.new(
+        required_verification: [
+          "independent",
+          "requireDeterministicChecks",
+          "requireDifferentBackend",
+          "requireUiEvidence"
+        ],
+        minimum_coverage_percent: 80
+      )
+
+    assert {:error, errors} = ProjectManifest.validate(weakened, platform_policy: policy)
+
+    for requirement <- ~w(
+          independent
+          requireDeterministicChecks
+          requireDifferentBackend
+          requireUiEvidence
+        ) do
+      assert_error(
+        errors,
+        :platform_policy_conflict,
+        "/verification/#{requirement}",
+        "requires #{requirement}"
+      )
+    end
+
+    assert_error(
+      errors,
+      :platform_policy_conflict,
+      "/verification/minimumCoveragePercent",
+      "at least 80"
+    )
+
+    stricter =
+      put_in(weakened, ["verification"], %{
+        "independent" => true,
+        "requireDeterministicChecks" => true,
+        "requireDifferentBackend" => true,
+        "requireUiEvidence" => true,
+        "minimumCoveragePercent" => 95
+      })
+
+    assert {:ok, normalized} = ProjectManifest.validate(stricter, platform_policy: policy)
+    assert normalized.verification["minimumCoveragePercent"] == 95
+  end
+
+  test "every repository budget above its platform ceiling fails at the requested path" do
+    manifest =
+      valid_manifest()
+      |> Map.put("budgets", %{
+        "maxCostUsd" => 10.0000001,
+        "maxRuntimeMinutes" => 61,
+        "maxAgentTurns" => 41,
+        "maxRepairCycles" => 3
+      })
+
+    policy =
+      Policy.new(
+        max_cost_microusd: 10_000_000,
+        max_runtime_minutes: 60,
+        max_agent_turns: 40,
+        max_repair_cycles: 2
+      )
+
+    assert {:error, errors} = ProjectManifest.validate(manifest, platform_policy: policy)
+
+    assert_error(errors, :platform_policy_conflict, "/budgets/maxCostUsd", "10000000")
+    assert_error(errors, :platform_policy_conflict, "/budgets/maxRuntimeMinutes", "60")
+    assert_error(errors, :platform_policy_conflict, "/budgets/maxAgentTurns", "40")
+    assert_error(errors, :platform_policy_conflict, "/budgets/maxRepairCycles", "2")
+  end
+
+  test "USD budgets normalize deterministically to integer microusd without rounding upward" do
+    yaml = """
+    schemaVersion: "0.1"
+    project: {name: exact-cost, description: exact cost, status: existing}
+    commands: {install: noop, test: noop}
+    autonomy:
+      createBranches: false
+      openPullRequests: false
+      mergeToDefault: false
+      deployToProduction: false
+    verification: {independent: true, requireDeterministicChecks: true}
+    budgets:
+      maxCostUsd: 0.000001999999
+      maxRuntimeMinutes: 1
+      maxAgentTurns: 1
+      maxRepairCycles: 0
+    """
+
+    json =
+      yaml
+      |> YamlElixir.read_from_string!()
+      |> Jason.encode!()
+
+    assert {:ok, yaml_manifest} = ProjectManifest.load_string(yaml, :yaml)
+    assert {:ok, json_manifest} = ProjectManifest.load_string(json, :json)
+    assert yaml_manifest.budgets["maxCostMicrousd"] == 1
+    assert json_manifest.budgets["maxCostMicrousd"] == 1
+    assert is_integer(yaml_manifest.budgets["maxCostMicrousd"])
+
+    exact_ceiling_policy = Policy.new(max_cost_microusd: 10_000_000)
+    yaml_over_ceiling = String.replace(yaml, "0.000001999999", "10.0000000000000001")
+
+    json_over_ceiling =
+      valid_manifest()
+      |> Jason.encode!()
+      |> String.replace(~s("maxCostUsd":10), ~s("maxCostUsd":10.0000000000000001))
+
+    for {source, format} <- [{yaml_over_ceiling, :yaml}, {json_over_ceiling, :json}] do
+      assert {:error, errors} =
+               ProjectManifest.load_string(
+                 source,
+                 format,
+                 platform_policy: exact_ceiling_policy
+               )
+
+      assert_error(errors, :platform_policy_conflict, "/budgets/maxCostUsd")
+    end
   end
 
   test "validation neither executes commands nor mutates repository-provided files" do
@@ -278,6 +543,11 @@ defmodule Sxf.ProjectManifestTest do
 
     assert {:error, [%Error{code: :invalid_platform_policy}]} =
              ProjectManifest.validate(valid_manifest(), platform_policy: ["not", "keyword"])
+
+    invalid_ceiling = %Policy{max_cost_microusd: 0}
+
+    assert {:error, [%Error{code: :invalid_platform_policy}]} =
+             ProjectManifest.validate(valid_manifest(), platform_policy: invalid_ceiling)
   end
 
   defp valid_manifest do
@@ -305,9 +575,17 @@ defmodule Sxf.ProjectManifestTest do
       "budgets" => %{
         "maxCostUsd" => 10,
         "maxRuntimeMinutes" => 60,
+        "maxAgentTurns" => 40,
         "maxRepairCycles" => 2
       }
     }
+  end
+
+  defp example_policy do
+    Policy.new(
+      allowed_autonomy: ["createIssues", "createBranches", "openPullRequests"],
+      allowed_network_domains: ["github.com", "registry.npmjs.org"]
+    )
   end
 
   defp assert_error(errors, code, path, message_fragment \\ nil) do
