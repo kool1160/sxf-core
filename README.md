@@ -53,7 +53,8 @@ Idea / Specification / GitHub Issue
 
 ## Repository status
 
-SXF is implementing its Phase 1 durable core. The repository now contains the initial Elixir/OTP,
+SXF is implementing M3, the first autonomous vertical slice, after completing M1 and M2. The
+repository now contains the initial Elixir/OTP,
 Ecto, and SQLite WAL task domain: stable identities, an explicit lifecycle, transactional transition
 history, attempts, budgets, retries, leases, blockers, decisions, and evidence references. It also
 loads, strictly validates, normalizes, and applies platform policy ceilings to version `0.1` YAML or

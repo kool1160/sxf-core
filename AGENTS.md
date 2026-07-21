@@ -80,4 +80,7 @@ Escalate when:
 
 ## Current phase
 
-SXF is in the foundation phase. Do not lock the repository into a language, framework, queue, database, or cloud provider until the first vertical-slice architecture decision is documented.
+SXF is in M3, the First Autonomous Vertical Slice. M1's Symphony foundation and M2's durable core
+are accepted; the accepted implementation foundation is Elixir/OTP with Ecto and SQLite WAL. The
+current implementation target is GitHub Issue #4. Preserve the operating and security rules above,
+and do not begin M4-or-later functionality before M3's completion gate is satisfied.
