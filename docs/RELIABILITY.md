@@ -77,6 +77,11 @@ The control plane must reconcile desired state with observed state after restart
 - Duplicate webhook deliveries.
 - Rate-limit suspension and recovery.
 
+The imported Symphony scheduler's in-memory claims, blocked entries, timers, and retry counters are
+not authoritative and are not started by this import. Later scheduler adaptation must derive work,
+leases, retry deadlines, and restart actions from SQLite and treat tracker/workspace observations as
+reconciliation evidence only.
+
 ## Evidence requirements
 
 A successful task should include, as applicable:

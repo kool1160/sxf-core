@@ -64,6 +64,12 @@ Require explicit policy and usually human approval for:
 - Scan dependencies, containers, and generated artifacts.
 - Do not execute unreviewed remote scripts merely because a README recommends them.
 
+The pinned Symphony source is isolated under `upstream/openai-symphony`, covered by a deterministic
+per-file provenance manifest, and not started by SXF. Host-executed repository hooks and
+provider-native agent tools (including the broad upstream GitHub REST tool) are default-denied in
+the imported boundary. A later integration may enable equivalent behavior only inside the approved
+Linux-container worker and through task-scoped, durable policy and mutation controls.
+
 ## Builder and verifier separation
 
 The verifier must not inherit unnecessary builder credentials or writable access. Verification should be capable of rejecting work without modifying the implementation branch.

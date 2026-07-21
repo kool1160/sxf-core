@@ -59,13 +59,16 @@ Ecto, and SQLite WAL task domain: stable identities, an explicit lifecycle, tran
 history, attempts, budgets, retries, leases, blockers, decisions, and evidence references. It also
 loads, strictly validates, normalizes, and applies platform policy ceilings to version `0.1` YAML or
 JSON connected-project manifests without executing their commands. It does not yet contain the
-Symphony scheduler integration, GitHub integration, agent execution, workspace runtime, or evidence
-byte store.
+live Symphony scheduler integration, GitHub App integration, agent execution, container workspace
+runtime, or evidence byte store. The pinned Symphony Elixir foundation is retained under
+`upstream/openai-symphony` as a compile-time, default-denied path dependency; it is not started and
+does not replace SXF's durable task authority.
 
 See [`AGENTS.md`](AGENTS.md) for repository guidance, [`docs/TASK_DOMAIN.md`](docs/TASK_DOMAIN.md)
 for the durable lifecycle contract, [`docs/PROJECT_MANIFEST.md`](docs/PROJECT_MANIFEST.md) for the
-manifest validation contract, and [`docs/`](docs/) for broader product, architecture, reliability,
-security, and roadmap documents.
+manifest validation contract, [`docs/UPSTREAM_SYMPHONY.md`](docs/UPSTREAM_SYMPHONY.md) for the
+upstream boundary, and [`docs/`](docs/) for broader product, architecture, reliability, security,
+and roadmap documents.
 
 ## Durable-core checks
 

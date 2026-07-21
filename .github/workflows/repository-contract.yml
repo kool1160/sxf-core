@@ -32,8 +32,11 @@ jobs:
             docs/ROADMAP.md
             docs/TASK_DOMAIN.md
             docs/PROJECT_MANIFEST.md
+            docs/UPSTREAM_SYMPHONY.md
             schemas/project.schema.json
             examples/project.sxf.yaml
+            upstream/openai-symphony/SOURCE.md
+            upstream/openai-symphony/import-manifest.json
           )
 
           for file in "${required_files[@]}"; do
@@ -77,7 +80,30 @@ jobs:
           restore-keys: ${{ runner.os }}-mix-
 
       - name: Install dependencies
-        run: mix deps.get --only test
+        run: mix deps.get
+
+      - name: Fetch independently pinned Symphony source
+        shell: bash
+        env:
+          SYMPHONY_COMMIT: 633eae740f807de18007f5a9a25e2e0d206afdf4
+          SYMPHONY_REPOSITORY: https://github.com/openai/symphony.git
+        run: |
+          set -euo pipefail
+          upstream_checkout="${RUNNER_TEMP}/openai-symphony"
+          git init --quiet "${upstream_checkout}"
+          git -C "${upstream_checkout}" remote add origin "${SYMPHONY_REPOSITORY}"
+          git -C "${upstream_checkout}" fetch --quiet --no-tags --depth=1 origin "${SYMPHONY_COMMIT}"
+          fetched_commit="$(git -C "${upstream_checkout}" rev-parse 'FETCH_HEAD^{commit}')"
+          test "${fetched_commit}" = "${SYMPHONY_COMMIT}"
+          echo "SXF_SYMPHONY_UPSTREAM_CHECKOUT=${upstream_checkout}" >> "${GITHUB_ENV}"
+
+      - name: Verify Symphony import provenance and licensing
+        env:
+          MIX_ENV: test
+        run: |
+          mix run --no-start scripts/verify_symphony_import.exs
+          mix run --no-start scripts/verify_symphony_import.exs \
+            --verify-upstream "${SXF_SYMPHONY_UPSTREAM_CHECKOUT}"
 
       - name: Audit dependencies
         run: mix hex.audit
@@ -95,3 +121,54 @@ jobs:
 
       - name: Run durable-core tests
         run: mix test
+
+  symphony-conformance:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: upstream/openai-symphony/elixir
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Erlang and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28.4"
+          elixir-version: "1.19.5"
+
+      - name: Restore upstream dependency and build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            upstream/openai-symphony/elixir/deps
+            upstream/openai-symphony/elixir/_build
+          key: ${{ runner.os }}-symphony-mix-${{ hashFiles('upstream/openai-symphony/elixir/mix.lock') }}
+          restore-keys: ${{ runner.os }}-symphony-mix-
+
+      - name: Install imported dependencies
+        run: mix deps.get
+
+      - name: Audit imported dependencies
+        run: mix hex.audit
+
+      - name: Reject unused imported lock entries
+        run: mix deps.unlock --check-unused
+
+      - name: Verify imported formatting
+        run: mix format --check-formatted
+
+      - name: Compile imported foundation without warnings
+        env:
+          MIX_ENV: test
+        run: mix compile --warnings-as-errors
+
+      - name: Run selected upstream conformance tests
+        run: >-
+          mix test
+          test/symphony_elixir/core_test.exs
+          test/symphony_elixir/workspace_and_config_test.exs
+          test/symphony_elixir/app_server_test.exs
+          test/symphony_elixir/github_adapter_test.exs
+          test/symphony_elixir/orchestrator_status_test.exs
+          test/symphony_elixir/extensions_test.exs
