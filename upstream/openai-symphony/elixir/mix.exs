@@ -1,3 +1,8 @@
+# SXF MODIFICATION NOTICE
+# Modified from openai/symphony@633eae740f807de18007f5a9a25e2e0d206afdf4,
+# original path elixir/mix.exs. SXF raises dependency constraints for Decimal 3 compatibility and
+# remediated security releases; the imported application remains Apache-2.0 licensed.
+
 defmodule SymphonyElixir.MixProject do
   use Mix.Project
 
@@ -69,16 +74,16 @@ defmodule SymphonyElixir.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:bandit, "~> 1.8"},
+      {:bandit, "~> 1.12"},
       {:floki, ">= 0.30.0", only: :test},
       {:lazy_html, ">= 0.1.0", only: :test},
       {:phoenix, "~> 1.8.0"},
       {:phoenix_html, "~> 4.2"},
       {:phoenix_live_view, "~> 1.1.0"},
-      {:req, "~> 0.5"},
+      {:req, "~> 0.6.3"},
       {:jason, "~> 1.4"},
       {:yaml_elixir, "~> 2.12"},
-      {:solid, "~> 1.2"},
+      {:solid, "~> 1.3"},
       {:ecto, "~> 3.13"},
       {:burrito, "~> 1.5", only: :prod, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

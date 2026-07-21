@@ -1,3 +1,8 @@
+# SXF MODIFICATION NOTICE
+# Modified from openai/symphony@633eae740f807de18007f5a9a25e2e0d206afdf4,
+# original path elixir/lib/symphony_elixir/workspace.ex. SXF default-denies repository-owned host
+# hooks until execution is inside the approved Linux-container worker boundary. Apache-2.0 applies.
+
 defmodule SymphonyElixir.Workspace do
   @moduledoc """
   Creates isolated per-issue workspaces for parallel Codex agents.
@@ -296,6 +301,14 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp maybe_run_before_remove_hook(workspace, worker_host) when is_binary(worker_host) do
+    if host_hooks_enabled?() do
+      do_run_remote_before_remove_hook(workspace, worker_host)
+    else
+      :ok
+    end
+  end
+
+  defp do_run_remote_before_remove_hook(workspace, worker_host) do
     hooks = Config.settings!().hooks
 
     case hooks.before_remove do
@@ -336,7 +349,17 @@ defmodule SymphonyElixir.Workspace do
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
-  defp run_hook(command, workspace, issue_context, hook_name, nil) do
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host) do
+    if host_hooks_enabled?() do
+      do_run_hook(command, workspace, issue_context, hook_name, worker_host)
+    else
+      Logger.warning("Workspace hook denied by SXF policy hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host_for_log(worker_host)}")
+
+      {:error, {:host_hooks_disabled, hook_name}}
+    end
+  end
+
+  defp do_run_hook(command, workspace, issue_context, hook_name, nil) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
@@ -359,7 +382,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+  defp do_run_hook(command, workspace, issue_context, hook_name, worker_host)
+       when is_binary(worker_host) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
@@ -398,6 +422,10 @@ defmodule SymphonyElixir.Workspace do
       false ->
         binary_part(binary_output, 0, max_bytes) <> "... (truncated)"
     end
+  end
+
+  defp host_hooks_enabled? do
+    Application.get_env(:symphony_elixir, :host_hooks_enabled, false) == true
   end
 
   defp validate_workspace_path(workspace, nil) when is_binary(workspace) do

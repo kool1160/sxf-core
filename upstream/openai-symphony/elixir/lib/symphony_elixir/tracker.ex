@@ -1,3 +1,8 @@
+# SXF MODIFICATION NOTICE
+# Modified from openai/symphony@633eae740f807de18007f5a9a25e2e0d206afdf4,
+# original path elixir/lib/symphony_elixir/tracker.ex. SXF default-denies provider-native agent
+# tools until a later policy-checked integration explicitly enables them. Apache-2.0 applies.
+
 defmodule SymphonyElixir.Tracker do
   @moduledoc """
   Adapter boundary for issue tracker reads and provider-native agent tools.
@@ -104,7 +109,8 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp adapter_agent_tool_specs(adapter) do
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :agent_tool_specs, 0) do
+    if provider_native_tools_enabled?() and Code.ensure_loaded?(adapter) and
+         function_exported?(adapter, :agent_tool_specs, 0) do
       adapter.agent_tool_specs()
     else
       []
@@ -112,10 +118,11 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp execute_agent_tool_with_adapter(adapter, tool, arguments, opts) do
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :execute_agent_tool, 3) do
+    if provider_native_tools_enabled?() and Code.ensure_loaded?(adapter) and
+         function_exported?(adapter, :execute_agent_tool, 3) do
       adapter.execute_agent_tool(tool, arguments, opts)
     else
-      unsupported_agent_tool_response(tool)
+      unavailable_agent_tool_response(tool)
     end
   end
 
@@ -123,11 +130,15 @@ defmodule SymphonyElixir.Tracker do
     adapter.secret_environment_names(tracker_settings)
   end
 
-  defp unsupported_agent_tool_response(tool) do
+  defp provider_native_tools_enabled? do
+    Application.get_env(:symphony_elixir, :provider_native_tools_enabled, false) == true
+  end
+
+  defp unavailable_agent_tool_response(tool) do
     output =
       Jason.encode!(%{
         "error" => %{
-          "message" => "Unsupported dynamic tool: #{inspect(tool)}.",
+          "message" => "Provider-native tools are disabled or unsupported: #{inspect(tool)}.",
           "supportedTools" => []
         }
       })

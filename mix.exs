@@ -30,6 +30,7 @@ defmodule SxfCore.MixProject do
       {:ecto_sqlite3, "~> 0.24"},
       {:jason, "~> 1.4"},
       {:jsonschex, "~> 0.8.1"},
+      {:symphony_elixir, path: "upstream/openai-symphony/elixir", runtime: false},
       {:yaml_elixir, "~> 2.12.2"}
     ]
   end

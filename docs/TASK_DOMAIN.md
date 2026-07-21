@@ -7,7 +7,8 @@ and worker processes are projections or clients of this model; none is a workflo
 
 ## Scope
 
-The current code provides the smallest durable layer needed before Symphony scheduling is adapted:
+The current SXF-owned code provides the smallest durable layer needed before the imported Symphony
+scheduler is adapted:
 
 - Ecto schemas and a versioned migration;
 - SQLite configured for WAL mode, foreign keys, immediate write transactions, and a busy timeout;
@@ -18,8 +19,10 @@ The current code provides the smallest durable layer needed before Symphony sche
 - durable retry deadlines, budgets, usage, leases, blockers, and restart queries; and
 - inbox/outbox reference records that reserve integration boundaries without implementing them.
 
-It deliberately does not implement a scheduler, tracker adapter, agent runtime, workspace manager,
-evidence byte store, webhook processor, external-action dispatcher, or user interface.
+It deliberately does not activate or integrate a scheduler, tracker adapter, agent runtime,
+workspace manager, evidence byte store, webhook processor, external-action dispatcher, or user
+interface. The quarantined upstream source is compiled for conformance only and is not a second
+workflow authority.
 
 ## Durable records and identity
 

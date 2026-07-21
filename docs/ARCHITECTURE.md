@@ -72,6 +72,12 @@ are terminal until an explicit approved reopen; `DEPLOYED` is permanently termin
 
 Selects ready work while respecting repository concurrency, dependencies, rate limits, cost budgets, workspace capacity, and conflicting file or subsystem ownership.
 
+The pinned Symphony Elixir scheduler is retained at `upstream/openai-symphony/elixir` as an
+Apache-2.0, compile-time path dependency. It is not in the SXF supervision tree. Its dispatch,
+retry, reconciliation, workspace, tracker, and Codex protocol semantics are the adaptation
+baseline, but it cannot claim work until a later integration obtains authority from the durable
+SXF task ledger and lease boundary.
+
 ### Workspace manager
 
 Creates a clean, isolated workspace for each attempt. A workspace contains only the repository state, scoped credentials, tools, and network access required for the task.
