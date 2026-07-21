@@ -496,6 +496,45 @@ defmodule Sxf.ProjectManifestTest do
     end
   end
 
+  test "quoted YAML numeric-looking and special cost strings remain schema errors" do
+    yaml = """
+    schemaVersion: "0.1"
+    project: {name: quoted-cost, description: quoted cost, status: existing}
+    commands: {install: noop, test: noop}
+    autonomy:
+      createBranches: false
+      openPullRequests: false
+      mergeToDefault: false
+      deployToProduction: false
+    verification: {independent: true, requireDeterministicChecks: true}
+    budgets:
+      maxCostUsd: VALUE
+      maxRuntimeMinutes: 1
+      maxAgentTurns: 1
+      maxRepairCycles: 0
+    """
+
+    for value <- ~w(10 10.0000001 1e3 NaN Infinity) do
+      source = String.replace(yaml, "VALUE", ~s("#{value}"))
+
+      assert {:error, errors} = ProjectManifest.load_string(source, :yaml)
+      assert_error(errors, :schema_validation, "/budgets/maxCostUsd")
+    end
+
+    json_manifest =
+      valid_manifest()
+      |> Map.put("budgets", %{
+        "maxCostUsd" => 10,
+        "maxRuntimeMinutes" => 60,
+        "maxAgentTurns" => 40,
+        "maxRepairCycles" => 2
+      })
+      |> Jason.encode!()
+
+    assert {:ok, normalized} = ProjectManifest.load_string(json_manifest, :json)
+    assert normalized.budgets["maxCostMicrousd"] == 10_000_000
+  end
+
   test "validation neither executes commands nor mutates repository-provided files" do
     directory = temporary_directory!()
     marker_path = Path.join(directory, "command-ran")

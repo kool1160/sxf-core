@@ -165,10 +165,12 @@ defmodule Sxf.ProjectManifest do
   defp preserve_exact_yaml_cost(content, decoded) do
     case YamlElixir.read_all_from_string(content, schema: :failsafe) do
       {:ok, [raw]} ->
-        case get_in(raw, ["budgets", "maxCostUsd"]) do
-          value when is_binary(value) ->
+        decoded_cost = get_in(decoded, ["budgets", "maxCostUsd"])
+
+        case {decoded_cost, get_in(raw, ["budgets", "maxCostUsd"])} do
+          {value, raw_value} when is_number(value) and is_binary(raw_value) ->
             try do
-              {:ok, put_in(decoded, ["budgets", "maxCostUsd"], Decimal.new(value))}
+              {:ok, put_in(decoded, ["budgets", "maxCostUsd"], Decimal.new(raw_value))}
             rescue
               Decimal.Error -> {:ok, decoded}
             end
