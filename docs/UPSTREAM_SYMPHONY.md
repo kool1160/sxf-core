@@ -19,9 +19,13 @@ examples are not imported.
 
 Every retained file is listed in `upstream/openai-symphony/import-manifest.json` with its original
 path and Git blob, imported path and SHA-256, license, modification state, and required notice
-state. `scripts/verify_symphony_import.exs` deterministically verifies that manifest. A modified
-upstream file carries an SXF modification notice identifying the upstream repository, pinned
-commit, and original path.
+state. `scripts/verify_symphony_import.exs` retains an offline mode that checks the imported index,
+hashes, modification declarations, markers, license, and NOTICE against that manifest. Required
+Linux CI also fetches the public pinned commit into a separate checkout and resolves
+`633eae740f807de18007f5a9a25e2e0d206afdf4:<upstreamPath>` for every entry. The verifier compares
+each independently resolved Git blob to `upstreamGitBlobSha`, so coordinated drift of an imported
+file and its manifest entry cannot pass the authoritative check. A modified upstream file carries
+an SXF modification notice identifying the upstream repository, pinned commit, and original path.
 
 This method is safer than flattening modules into `lib/sxf`: the Apache-2.0 code remains visibly
 separate from proprietary SXF code, upstream file paths stay stable, blob identity remains
@@ -59,7 +63,8 @@ must describe exact version changes and conformance evidence.
 2. Review the upstream specification, Elixir source, tests, dependencies, license, and NOTICE diff.
 3. Update the subtree without flattening or renaming upstream paths.
 4. Reapply the smallest SXF patch series and retain compliant modification notices.
-5. Regenerate and verify the import manifest.
+5. Regenerate the import manifest, run its offline checks, and verify every entry against a fresh
+   fetch of the pinned public upstream commit.
 6. Run license/NOTICE verification, the selected upstream conformance profile, full SXF checks,
    dependency audit, and Linux CI.
 7. Record semantic changes, deferred integration work, and unresolved risks in the upgrade pull

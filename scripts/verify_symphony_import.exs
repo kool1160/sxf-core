@@ -1,6 +1,8 @@
 defmodule Sxf.VerifySymphonyImport do
   @moduledoc false
 
+  alias Sxf.SymphonyImportProvenance
+
   @repository "https://github.com/openai/symphony.git"
   @commit "633eae740f807de18007f5a9a25e2e0d206afdf4"
   @import_root "upstream/openai-symphony"
@@ -34,7 +36,22 @@ defmodule Sxf.VerifySymphonyImport do
     IO.puts("generated #{length(files)} Symphony import entries")
   end
 
+  def main(["--verify-upstream", upstream_checkout]) do
+    verify!(upstream_checkout)
+  end
+
   def main([]) do
+    verify!()
+  end
+
+  def main(_args),
+    do:
+      raise(
+        "usage: mix run --no-start scripts/verify_symphony_import.exs " <>
+          "[--generate UPSTREAM_CHECKOUT | --verify-upstream UPSTREAM_CHECKOUT]"
+      )
+
+  defp verify!(upstream_checkout \\ nil) do
     manifest = @manifest_path |> File.read!() |> Jason.decode!()
 
     assert!(manifest["manifestVersion"] == 1, "unexpected manifest version")
@@ -55,18 +72,20 @@ defmodule Sxf.VerifySymphonyImport do
       "duplicate manifest path"
     )
 
-    Enum.each(entries, &verify_entry!/1)
+    if upstream_checkout, do: verify_upstream_checkout!(upstream_checkout)
+
+    Enum.each(entries, &verify_entry!(&1, upstream_checkout))
     verify_retained_notices!()
 
     modified_count = Enum.count(entries, & &1["modified"])
-    IO.puts("verified #{length(entries)} Symphony files (#{modified_count} modified)")
-  end
 
-  def main(_args),
-    do:
-      raise(
-        "usage: mix run --no-start scripts/verify_symphony_import.exs [--generate UPSTREAM_CHECKOUT]"
-      )
+    upstream_suffix =
+      if upstream_checkout, do: " against pinned upstream", else: " with offline checks"
+
+    IO.puts(
+      "verified #{length(entries)} Symphony files (#{modified_count} modified)#{upstream_suffix}"
+    )
+  end
 
   defp imported_paths do
     File.cwd!()
@@ -100,9 +119,10 @@ defmodule Sxf.VerifySymphonyImport do
     }
   end
 
-  defp verify_entry!(entry) do
+  defp verify_entry!(entry, upstream_checkout) do
     imported_path = entry["importedPath"]
     upstream_path = entry["upstreamPath"]
+    expected_upstream_path = upstream_path(imported_path)
     modified = entry["modified"]
     notice_required = entry["modificationNoticeRequired"]
     imported_blob = git!(File.cwd!(), ["rev-parse", ":#{imported_path}"])
@@ -115,6 +135,18 @@ defmodule Sxf.VerifySymphonyImport do
 
     assert!(entry["pinnedCommit"] == @commit, "commit mismatch for #{imported_path}")
     assert!(entry["license"] == "Apache-2.0", "license mismatch for #{imported_path}")
+
+    assert!(
+      upstream_path == expected_upstream_path,
+      "upstream path mismatch for #{imported_path}: #{upstream_path}"
+    )
+
+    if upstream_checkout do
+      actual_upstream_blob =
+        git!(upstream_checkout, ["rev-parse", "#{@commit}:#{upstream_path}"])
+
+      SymphonyImportProvenance.assert_pinned_blob!(entry, actual_upstream_blob)
+    end
 
     assert!(
       entry["importedGitBlobSha"] == imported_blob,
@@ -169,6 +201,14 @@ defmodule Sxf.VerifySymphonyImport do
 
     assert!(apache == imported_apache, "repository Apache-2.0 text differs from pinned upstream")
     assert!(notice == imported_notice, "repository Symphony NOTICE differs from pinned upstream")
+  end
+
+  defp verify_upstream_checkout!(upstream_checkout) do
+    resolved_commit = git!(upstream_checkout, ["rev-parse", "#{@commit}^{commit}"])
+    origin = git!(upstream_checkout, ["remote", "get-url", "origin"])
+
+    assert!(resolved_commit == @commit, "pinned upstream commit is unavailable")
+    assert!(origin == @repository, "unexpected upstream checkout origin: #{origin}")
   end
 
   defp upstream_path("upstream/openai-symphony/elixir/" <> relative), do: "elixir/" <> relative

@@ -10,7 +10,9 @@
 
 The root upstream `SPEC.md`, `LICENSE`, and `NOTICE` are retained byte-for-byte. The Elixir subtree
 preserves upstream paths and history. `import-manifest.json` records per-file source and imported
-identity. Files marked modified remain Apache-2.0 and carry an SXF modification notice.
+identity. Required CI independently resolves every recorded upstream blob from the public pinned
+commit; the checked-in manifest is not its own provenance authority. Files marked modified remain
+Apache-2.0 and carry an SXF modification notice.
 
 Original SXF code outside this boundary remains governed by the repository-root proprietary
 `LICENSE`; that notice does not relicense this imported material.

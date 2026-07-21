@@ -82,10 +82,28 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
+      - name: Fetch independently pinned Symphony source
+        shell: bash
+        env:
+          SYMPHONY_COMMIT: 633eae740f807de18007f5a9a25e2e0d206afdf4
+          SYMPHONY_REPOSITORY: https://github.com/openai/symphony.git
+        run: |
+          set -euo pipefail
+          upstream_checkout="${RUNNER_TEMP}/openai-symphony"
+          git init --quiet "${upstream_checkout}"
+          git -C "${upstream_checkout}" remote add origin "${SYMPHONY_REPOSITORY}"
+          git -C "${upstream_checkout}" fetch --quiet --no-tags --depth=1 origin "${SYMPHONY_COMMIT}"
+          fetched_commit="$(git -C "${upstream_checkout}" rev-parse 'FETCH_HEAD^{commit}')"
+          test "${fetched_commit}" = "${SYMPHONY_COMMIT}"
+          echo "SXF_SYMPHONY_UPSTREAM_CHECKOUT=${upstream_checkout}" >> "${GITHUB_ENV}"
+
       - name: Verify Symphony import provenance and licensing
         env:
           MIX_ENV: test
-        run: mix run --no-start scripts/verify_symphony_import.exs
+        run: |
+          mix run --no-start scripts/verify_symphony_import.exs
+          mix run --no-start scripts/verify_symphony_import.exs \
+            --verify-upstream "${SXF_SYMPHONY_UPSTREAM_CHECKOUT}"
 
       - name: Audit dependencies
         run: mix hex.audit
