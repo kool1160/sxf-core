@@ -146,7 +146,7 @@ returned unchanged but never executed and that the directory contents remained u
 
 ## M2 scope and evidence
 
-This work is required by the active M2 completion gate. Completion evidence is the checked-in
+This work was required by the M2 completion gate. Completion evidence is the checked-in
 example test, YAML/JSON equivalence, strict schema failures, budget/verification/authority policy
 regressions, decoded-structure and YAML-reference limits, non-execution and non-mutation regression,
 dependency audit, compilation without warnings, and full test suite.
