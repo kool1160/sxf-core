@@ -32,6 +32,7 @@ jobs:
             docs/ROADMAP.md
             docs/TASK_DOMAIN.md
             docs/PROJECT_MANIFEST.md
+            docs/EXECUTION_COORDINATOR.md
             docs/UPSTREAM_SYMPHONY.md
             schemas/project.schema.json
             examples/project.sxf.yaml

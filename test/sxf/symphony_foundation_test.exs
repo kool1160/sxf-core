@@ -113,7 +113,7 @@ defmodule Sxf.SymphonyFoundationTest do
   end
 
   defp temporary_directory! do
-    path = Path.join(System.tmp_dir!(), "sxf-symphony-#{System.unique_integer([:positive])}")
+    path = Path.join(System.tmp_dir!(), "sxf-symphony-#{Ecto.UUID.generate()}")
     File.mkdir_p!(path)
     path
   end

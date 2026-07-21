@@ -158,6 +158,8 @@ defmodule Sxf.Tasks.TaskAttempt do
     field :started_at, :utc_datetime_usec
     field :finished_at, :utc_datetime_usec
     field :outcome, :string
+    field :execution_event_sequence, :integer, default: 0
+    field :lock_version, :integer, default: 1
     field :metadata, :map, default: %{}
     belongs_to :task, Sxf.Tasks.Task
     timestamps()
@@ -179,6 +181,7 @@ defmodule Sxf.Tasks.TaskAttempt do
       :started_at,
       :finished_at,
       :outcome,
+      :execution_event_sequence,
       :metadata
     ])
     |> validate_required([:task_id, :sequence, :status, :idempotency_key, :request_fingerprint])
@@ -188,6 +191,13 @@ defmodule Sxf.Tasks.TaskAttempt do
     |> foreign_key_constraint(:task_id)
     |> unique_constraint([:task_id, :sequence])
     |> unique_constraint([:task_id, :idempotency_key])
+  end
+
+  def event_changeset(attempt, attrs) do
+    attempt
+    |> cast(attrs, [:execution_event_sequence, :backend_session_id])
+    |> validate_number(:execution_event_sequence, greater_than_or_equal_to: 0)
+    |> optimistic_lock(:lock_version)
   end
 end
 

@@ -78,9 +78,11 @@ The control plane must reconcile desired state with observed state after restart
 - Rate-limit suspension and recovery.
 
 The imported Symphony scheduler's in-memory claims, blocked entries, timers, and retry counters are
-not authoritative and are not started by this import. Later scheduler adaptation must derive work,
-leases, retry deadlines, and restart actions from SQLite and treat tracker/workspace observations as
-reconciliation evidence only.
+not authoritative and are not started. The SXF coordinator derives work, leases, retry deadlines,
+and restart actions from SQLite. It rejects stale fenced events, persists exact event and renewal
+replays, reconciles expired leases, and inspects unexpired sessions only through the agent backend.
+Tracker, workspace, sandbox, and backend observations are reconciliation evidence only. See
+[`EXECUTION_COORDINATOR.md`](EXECUTION_COORDINATOR.md).
 
 ## Evidence requirements
 

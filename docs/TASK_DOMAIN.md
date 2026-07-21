@@ -7,8 +7,8 @@ and worker processes are projections or clients of this model; none is a workflo
 
 ## Scope
 
-The current SXF-owned code provides the smallest durable layer needed before the imported Symphony
-scheduler is adapted:
+The current SXF-owned code provides the durable layer and M3 coordinator needed to adapt accepted
+Symphony execution semantics without starting its orchestrator:
 
 - Ecto schemas and a versioned migration;
 - SQLite configured for WAL mode, foreign keys, immediate write transactions, and a busy timeout;
@@ -16,13 +16,15 @@ scheduler is adapted:
 - a pure lifecycle state machine;
 - transactional task creation and transitions;
 - idempotent attempt, retry, usage, blocker-resolution, and human-decision commands;
-- durable retry deadlines, budgets, usage, leases, blockers, and restart queries; and
+- durable retry deadlines, budgets, usage, leases, fenced execution events, lease renewals,
+  blockers, and restart queries;
+- atomic eligible-task and due-retry claims through provider-neutral execution contracts; and
 - inbox/outbox reference records that reserve integration boundaries without implementing them.
 
-It deliberately does not activate or integrate a scheduler, tracker adapter, agent runtime,
-workspace manager, evidence byte store, webhook processor, external-action dispatcher, or user
-interface. The quarantined upstream source is compiled for conformance only and is not a second
-workflow authority.
+It deliberately activates no live tracker, agent runtime, repository workspace, sandbox, evidence
+byte store, webhook processor, external-action dispatcher, or user interface. The coordinator is
+tested only with deterministic boundary fakes. The quarantined upstream application is compiled
+for conformance only and is not a second workflow authority.
 
 ## Durable records and identity
 
@@ -44,6 +46,8 @@ session IDs are opaque strings attached to stable SXF IDs; they never become pri
 | `usage_entries` | Append-oriented, idempotent increments against one budget. |
 | `retry_schedules` | Wall-clock `due_at`, sequence, reason, resume state, and durable status. |
 | `worker_leases` | Worker claim, expiry/heartbeat, and monotonically increasing fencing token. |
+| `lease_renewals` | Append-only fingerprinted lease extensions; each extension must move expiry forward. |
+| `execution_events` | Append-only structured backend facts with attempt-local sequence, lease fencing token, actor, correlation, idempotency fingerprint, and payload. |
 | `blockers` | Active/resolved stop reason and the state to resume after resolution. |
 | `human_decisions` | Explicit approval, rejection, unblock, cancellation, reopen, deploy, or budget-override decision scoped to one identified transition or blocker-resolution action. |
 | `external_event_inbox_references` | Unique external delivery reference and payload hash for future idempotent intake. |
@@ -61,7 +65,15 @@ the task's project. Every record that carries both `task_id` and `attempt_id` ha
 key to the attempt's `(id, task_id)`, and transition/evidence attachments carry and constrain their
 common task ID. Commands also reject mismatches before attempting a write. Adapter bugs or direct
 database writes therefore cannot associate an attempt, evidence reference, budget, lease, blocker,
-retry, usage entry, transition, or outbox action with a different task.
+retry, usage entry, execution event, lease renewal, transition, or outbox action with a different
+task.
+
+`task_attempts.execution_event_sequence` is the durable projection version for backend events.
+Accepting an event and incrementing that projection happen in one transaction. The next event must
+be exactly one greater. Its lease must be active and unexpired, its fencing token must be the newest
+token for the task, and its attempt must still be running. Exact replay returns the original row;
+reuse with any different accepted input conflicts. See
+[`EXECUTION_COORDINATOR.md`](EXECUTION_COORDINATOR.md).
 
 ## Authority and transaction boundary
 

@@ -713,7 +713,7 @@ defmodule Sxf.Tasks do
   end
 
   defp budget_has_capacity?(budget) do
-    Enum.all?(UsageEntry.metrics(), fn metric ->
+    Enum.all?(~w(cost_microusd runtime_ms agent_turns), fn metric ->
       case limit_for(budget, metric) do
         nil -> true
         limit -> usage_total(budget.id, metric) < limit
@@ -858,7 +858,7 @@ defmodule Sxf.Tasks do
           |> Repo.insert()
           |> unwrap_or_rollback()
 
-        exhausted? = not budget_has_capacity?(budget)
+        exhausted? = not metric_has_capacity?(budget, attrs.metric)
 
         if exhausted? do
           budget
@@ -1034,6 +1034,13 @@ defmodule Sxf.Tasks do
   defp limit_for(budget, "agent_turns"), do: budget.max_agent_turns
   defp limit_for(budget, "repair_cycles"), do: budget.max_repair_cycles
   defp limit_for(budget, "provider_retries"), do: budget.max_provider_retries
+
+  defp metric_has_capacity?(budget, metric) do
+    case limit_for(budget, metric) do
+      nil -> true
+      limit -> usage_total(budget.id, metric) < limit
+    end
+  end
 
   defp creation_fingerprint(attrs) do
     fingerprint(%{
