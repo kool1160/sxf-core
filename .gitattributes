@@ -1,0 +1,1 @@
+upstream/openai-symphony/elixir/test/fixtures/status_dashboard_snapshots/*.evidence.md whitespace=-blank-at-eol
