@@ -34,9 +34,14 @@ exits. The execution supervisor uses `:one_for_all` so a coordinator restart als
 execution children before durable reconciliation.
 
 The active-process map, monitors, and BEAM timer references are liveness aids only. They are not
-workflow state. A production control tick reads a trusted clock and test code can pass an explicit
-observation time to the same control path; neither path changes the durable deadline. Restart
-recovery reconstructs claims, renewal sequence, and deadlines from SQLite.
+workflow state. The coordinator owns exactly one token-fenced control timer. Its deadline is the
+earliest active lease-renewal, runtime, lease-expiry, or bounded reconciliation deadline. Moving
+that deadline cancels the prior timer; a stale cancelled message is ignored and cannot start
+another timer chain. `control_tick_ms` is the maximum interval before durable orphan
+reconciliation, not a second polling authority. A production control tick reads a trusted clock
+and test code can pass an explicit observation time to the same control path. Restart recovery
+reconstructs claims, renewal sequence, and absolute runtime deadlines from SQLite; timer state is
+discardable.
 
 ## Backend seams
 
@@ -71,15 +76,23 @@ fencing token. Usage maps
 contain non-negative integer deltas only. The store writes each delta through the existing durable
 budget and usage commands; workers cannot replace or increase a limit. Reaching the runtime, turn,
 cost, repair-cycle, or provider-retry limit creates the existing durable blocker and `BLOCKED`
-transition atomically.
+transition atomically. After an accepted positive runtime delta, the same transaction calculates
+the tightest durable remaining runtime and moves the attempt's persisted absolute deadline to the
+earlier of its current value and `trusted observed_at + remaining runtime`. Exact event replay does
+not move the deadline or record usage twice. The coordinator reloads that field into the active
+entry and reschedules its one control timer when the deadline becomes earlier.
 
 While an execution child remains active, the coordinator renews before expiry without requiring a
 backend heartbeat. Lease extensions create append-only `lease_renewals` rows with a monotonic
 per-lease sequence and a deterministic key derived from the lease and sequence before updating the
-heartbeat and expiry. An extension must occur before expiry and move expiry forward. Exact renewal
-replay is idempotent; changed input conflicts. Stale or failed renewal terminates the execution
-child, invokes cancellation, releases only resources scoped to that fenced context, and prevents
-later events from being authoritative.
+heartbeat and expiry. The expiry formula is exactly `trusted renewed_at + lease_ttl_ms`; it never
+adds a TTL to the prior expiry. Configuration validation requires
+`0 < lease_renewal_interval_ms < lease_ttl_ms` and `control_tick_ms > 0`, so an on-time renewal
+strictly advances expiry while remaining bounded to one TTL after the latest heartbeat. An
+extension must occur before expiry and move expiry forward. Exact renewal replay is idempotent;
+changed input conflicts. Stale or failed renewal terminates the execution child, invokes
+cancellation, releases only resources scoped to that fenced context, and prevents later events
+from being authoritative.
 
 ## Outcomes, retries, and restart recovery
 
@@ -88,13 +101,14 @@ event, and advances `IMPLEMENTING -> CI_RUNNING`. Deterministic failure and a ba
 timeout become explicit `FAILED` outcomes; cancellation becomes `CANCELLED`. A backend declaration
 is distinct from control-plane runtime enforcement.
 
-The effective runtime deadline is derived from the attempt start and the tightest applicable
-durable runtime budget. When a hanging backend reaches it, the coordinator terminates the execution
-child, calls `AgentBackend.cancel/1` exactly once for that controlled stop, releases prepared
-resources, records the remaining runtime usage exactly once, exhausts the budget, creates the
-runtime blocker, finalizes the attempt and lease, and leaves the task `BLOCKED`. Cancellation and
-cleanup failures remain structured completion metadata; neither can turn the primary outcome into
-success. Later events are stale.
+The initial effective runtime deadline is derived from the attempt start and the tightest
+applicable durable runtime budget and is persisted on the attempt. Positive usage can only move it
+earlier as described above. When a hanging backend reaches it, the coordinator terminates the
+execution child, calls `AgentBackend.cancel/1` exactly once for that controlled stop, releases
+prepared resources, records the remaining runtime usage exactly once, exhausts the budget, creates
+the runtime blocker, finalizes the attempt and lease, and leaves the task `BLOCKED`. Cancellation
+and cleanup failures remain structured completion metadata; neither can turn the primary outcome
+into success. An event first observed at or after the deadline is rejected. Later events are stale.
 
 The initial execution attempt consumes no provider retry. Backend unavailability, an interrupted
 session, and an expired lease all call one durable provider-retry command. In the same transaction,
@@ -111,11 +125,22 @@ success.
 
 On restart, the coordinator first reconciles expired leases from SQLite. An expired lease becomes
 expired, its attempt becomes lost, and the task is blocked with a bounded recovery retry. It then
-inspects still-active claims owned by its worker identity through `AgentBackend`. A missing or
-unavailable session is durably completed as interrupted/backend-unavailable; a reported running
-session remains owned by its existing lease. Interrupted attempts and leases are marked `lost`,
-then blocked and scheduled within the provider-retry ceiling. This inspection result is evidence,
-not workflow state.
+inspects still-active claims owned by its worker identity through `AgentBackend` and revalidates the
+lease, fencing token, running attempt, and persisted runtime deadline after inspection. A session
+reported as running is resumed exactly once through a monitored `AgentBackend.resume/2` child only
+when the backend declares continuation support and the attempt has a durable session ID. Resume
+preserves the attempt, lease, fencing token, session, event sequence, renewal schedule, and runtime
+deadline; it does not prepare a new workspace or sandbox. If continuation is unsupported, the
+session identity is absent, inspection is missing/finished/unknown, supervised resume startup
+fails, or the resume call becomes unavailable, the coordinator cancels when supported and durably
+marks the attempt and lease lost through the existing interrupted/retry command. A finished
+inspection is never inferred to be success without a durable accepted completion event.
+
+Every active durable claim therefore becomes locally supervised, explicitly interrupted, expired,
+or timed out; none remains active but unowned. Repeated reconciliation skips locally owned entries,
+so it cannot launch a duplicate resume. The single production control timer also performs bounded
+periodic reconciliation of durable claims not present in the local map, allowing a still-running
+coordinator to detect orphaned or expired leases instead of relying only on startup recovery.
 
 The imported `SymphonyElixir.Orchestrator` remains outside `Sxf.Application`. Symphony's dispatch
 ordering, exponential retry bounds, continuation, event, usage, and reconciliation behavior are

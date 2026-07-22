@@ -38,7 +38,7 @@ session IDs are opaque strings attached to stable SXF IDs; they never become pri
 | `repository_registrations` | Stable repository ID plus opaque provider/external identity. Unique by `(provider, external_id)`. |
 | `actors` | Stable identity for a human, system, worker, agent backend, or external system. |
 | `tasks` | Current task projection, saved resume state, terminal timestamp, monotonic transition sequence, and optimistic lock version. |
-| `task_attempts` | Ordered, bounded execution/repair attempt with opaque backend and session references. |
+| `task_attempts` | Ordered, bounded execution/repair attempt with opaque backend/session references and the durable absolute runtime deadline. |
 | `task_transition_events` | Append-oriented prior/result state fact with a task-local sequence, actor, reason, time, correlation, idempotency key, request fingerprint, and any authorizing human-decision reference. |
 | `evidence_references` | Immutable evidence metadata: kind, content hash, storage URI, producer, task/attempt, size, and finalization time. |
 | `event_evidence_references` | Many-to-many attachment of finalized evidence to a transition. |
@@ -166,9 +166,11 @@ happy-path states are illegal.
   attempt. Exact recovery replay does not reserve twice. If capacity is unavailable, the retry row
   is retained as `exhausted`; the system does not loop or convert the unknown attempt into success.
 - Active executions receive durable, sequenced lease renewals independently of backend heartbeat.
-  A control-plane runtime deadline is derived from durable attempt timing and the tightest runtime
-  ceiling. Reaching it records runtime usage and the runtime blocker atomically with attempt and
-  lease finalization; a backend-declared timeout remains a separate backend outcome.
+  Each renewal expires exactly one configured TTL after its trusted heartbeat. A control-plane
+  runtime deadline is derived from durable attempt timing and the tightest runtime ceiling,
+  persisted on the attempt, and moved only earlier after accepted positive runtime usage. Reaching
+  it records runtime usage and the runtime blocker atomically with attempt and lease finalization;
+  a backend-declared timeout remains a separate backend outcome.
 - `restart_snapshot/1` derives nonterminal tasks, due retries, stale leases, and due pending/unknown
   outbox actions from SQLite only. Scheduler memory may be discarded without losing authority.
 

@@ -92,16 +92,47 @@ defmodule Sxf.ExecutionFakes.Agent do
           :continue -> run_events(context, emit, :success)
         end
 
+      scenario when scenario in [:started_then_blocking, :started_then_hanging] ->
+        with :ok <- emit_events(context, emit) do
+          receive do
+            :continue -> {:ok, result(:success)}
+          end
+        end
+
+      :controllable ->
+        controllable_loop(context, emit)
+
       scenario ->
         run_events(context, emit, scenario)
     end
   end
 
   @impl true
-  def resume(context, emit), do: start(context, emit)
+  def resume(context, emit) do
+    if pid = context.options[:notify], do: send(pid, {:agent_resumed, self()})
+
+    case context.options[:resume_scenario] || :success do
+      :unavailable ->
+        {:error, :unavailable}
+
+      scenario when scenario in [:blocking, :hanging] ->
+        receive do
+          :continue -> {:ok, result(:success)}
+        end
+
+      scenario ->
+        run_events(context, emit, scenario)
+    end
+  end
 
   @impl true
-  def inspect(context), do: {:ok, context.options[:inspect] || :missing}
+  def inspect(context) do
+    case context.options[:inspect] || :missing do
+      inspect when is_function(inspect, 1) -> inspect.(context)
+      {:error, _reason} = error -> error
+      state -> {:ok, state}
+    end
+  end
 
   @impl true
   def cancel(context) do
@@ -114,14 +145,7 @@ defmodule Sxf.ExecutionFakes.Agent do
   end
 
   defp run_events(context, emit, scenario) do
-    events = context.options[:events] || [default_started_event(context)]
-
-    case Enum.reduce_while(events, :ok, fn event, :ok ->
-           case emit.(event) do
-             :ok -> {:cont, :ok}
-             {:error, reason} -> {:halt, {:error, reason}}
-           end
-         end) do
+    case emit_events(context, emit) do
       :ok ->
         {:ok, result(scenario)}
 
@@ -130,6 +154,39 @@ defmodule Sxf.ExecutionFakes.Agent do
 
       {:error, reason} ->
         {:error, {:event_rejected, reason}}
+    end
+  end
+
+  defp emit_events(context, emit) do
+    events = context.options[:events] || [default_started_event(context)]
+
+    Enum.reduce_while(events, :ok, fn event, :ok ->
+      case emit.(event) do
+        :ok ->
+          if pid = context.options[:notify], do: send(pid, {:event_emitted, event.id})
+          {:cont, :ok}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp controllable_loop(context, emit) do
+    receive do
+      {:emit, event} ->
+        case emit.(event) do
+          :ok ->
+            if pid = context.options[:notify], do: send(pid, {:event_emitted, event.id})
+            controllable_loop(context, emit)
+
+          {:error, reason} ->
+            if pid = context.options[:notify], do: send(pid, {:event_rejected, reason})
+            {:error, {:event_rejected, reason}}
+        end
+
+      :continue ->
+        {:ok, result(:success)}
     end
   end
 
@@ -154,4 +211,25 @@ defmodule Sxf.ExecutionFakes.Agent do
 
   defp result(:backend_unavailable),
     do: %Result{outcome: :backend_unavailable, reason: "fake backend unavailable"}
+end
+
+defmodule Sxf.ExecutionFakes.AgentWithoutResume do
+  @behaviour Sxf.Execution.AgentBackend
+
+  alias Sxf.ExecutionFakes.Agent
+
+  @impl true
+  def capabilities, do: %{continuation: false, cancellation: true, inspection: true, usage: true}
+
+  @impl true
+  defdelegate start(context, emit), to: Agent
+
+  @impl true
+  defdelegate resume(context, emit), to: Agent
+
+  @impl true
+  defdelegate inspect(context), to: Agent
+
+  @impl true
+  defdelegate cancel(context), to: Agent
 end

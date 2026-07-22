@@ -42,6 +42,10 @@ defmodule Sxf.Execution.Coordinator do
     :lease_ttl_ms,
     :lease_renewal_interval_ms,
     :control_tick_ms,
+    :control_timer_ref,
+    :control_timer_deadline,
+    :control_timer_token,
+    :next_reconciliation_at,
     :now_fn,
     :backend_options,
     automatic_timers: true,
@@ -70,40 +74,50 @@ defmodule Sxf.Execution.Coordinator do
 
   def await_idle(server, timeout \\ 30_000), do: GenServer.call(server, :await_idle, timeout)
   def active_count(server), do: GenServer.call(server, :active_count)
+  def control_timer(server), do: GenServer.call(server, :control_timer)
 
   @impl true
   def init(opts) do
     lease_ttl_ms = Keyword.get(opts, :lease_ttl_ms, 60_000)
     renewal_interval = Keyword.get(opts, :lease_renewal_interval_ms, div(lease_ttl_ms, 3))
+    control_tick_ms = Keyword.get(opts, :control_tick_ms, renewal_interval)
 
-    state = %__MODULE__{
-      task_store: Keyword.fetch!(opts, :task_store),
-      agent_backend: Keyword.fetch!(opts, :agent_backend),
-      workspace_backend: Keyword.fetch!(opts, :workspace_backend),
-      sandbox_backend: Keyword.fetch!(opts, :sandbox_backend),
-      task_supervisor: Keyword.get(opts, :task_supervisor, Sxf.Execution.TaskSupervisor),
-      actor_id: Keyword.fetch!(opts, :actor_id),
-      worker_id: Keyword.fetch!(opts, :worker_id),
-      backend_name: Keyword.get(opts, :backend_name, "fake"),
-      lease_ttl_ms: lease_ttl_ms,
-      lease_renewal_interval_ms: renewal_interval,
-      control_tick_ms: Keyword.get(opts, :control_tick_ms, renewal_interval),
-      automatic_timers: Keyword.get(opts, :automatic_timers, true),
-      now_fn: Keyword.get(opts, :now_fn, &DateTime.utc_now/0),
-      backend_options: Map.new(Keyword.get(opts, :backend_options, []))
-    }
+    with :ok <- validate_timing_config(lease_ttl_ms, renewal_interval, control_tick_ms) do
+      observed_at = Keyword.get(opts, :now_fn, &DateTime.utc_now/0).()
 
-    if Keyword.get(opts, :reconcile_on_start, true) do
-      {:ok, state, {:continue, :reconcile}}
+      state = %__MODULE__{
+        task_store: Keyword.fetch!(opts, :task_store),
+        agent_backend: Keyword.fetch!(opts, :agent_backend),
+        workspace_backend: Keyword.fetch!(opts, :workspace_backend),
+        sandbox_backend: Keyword.fetch!(opts, :sandbox_backend),
+        task_supervisor: Keyword.get(opts, :task_supervisor, Sxf.Execution.TaskSupervisor),
+        actor_id: Keyword.fetch!(opts, :actor_id),
+        worker_id: Keyword.fetch!(opts, :worker_id),
+        backend_name: Keyword.get(opts, :backend_name, "fake"),
+        lease_ttl_ms: lease_ttl_ms,
+        lease_renewal_interval_ms: renewal_interval,
+        control_tick_ms: control_tick_ms,
+        automatic_timers: Keyword.get(opts, :automatic_timers, true),
+        now_fn: Keyword.get(opts, :now_fn, &DateTime.utc_now/0),
+        backend_options: Map.new(Keyword.get(opts, :backend_options, [])),
+        next_reconciliation_at: DateTime.add(observed_at, control_tick_ms, :millisecond)
+      }
+
+      if Keyword.get(opts, :reconcile_on_start, true) do
+        {:ok, state, {:continue, :reconcile}}
+      else
+        {:ok, reschedule_control_timer(state)}
+      end
     else
-      {:ok, schedule_control_tick(state)}
+      {:error, reason} -> {:stop, {:invalid_timing_configuration, reason}}
     end
   end
 
   @impl true
   def handle_continue(:reconcile, state) do
-    do_reconcile(state)
-    {:noreply, schedule_control_tick(state)}
+    observed_at = state.now_fn.()
+    {_report, state} = do_reconcile(state, observed_at)
+    {:noreply, state |> reset_reconciliation_deadline(observed_at) |> reschedule_control_timer()}
   end
 
   @impl true
@@ -112,14 +126,28 @@ defmodule Sxf.Execution.Coordinator do
     {:reply, reply, state}
   end
 
-  def handle_call(:reconcile, _from, state), do: {:reply, do_reconcile(state), state}
+  def handle_call(:reconcile, _from, state) do
+    observed_at = state.now_fn.()
+    {report, state} = do_reconcile(state, observed_at)
+    state = state |> reset_reconciliation_deadline(observed_at) |> reschedule_control_timer()
+    {:reply, report, state}
+  end
 
   def handle_call({:advance, observed_at}, _from, state) do
     {results, state} = advance_active(state, observed_at)
-    {:reply, results, state}
+    {:reply, results, reschedule_control_timer(state)}
   end
 
   def handle_call(:active_count, _from, state), do: {:reply, map_size(state.active), state}
+
+  def handle_call(:control_timer, _from, state) do
+    {:reply,
+     %{
+       ref: state.control_timer_ref,
+       deadline: state.control_timer_deadline,
+       token: state.control_timer_token
+     }, state}
+  end
 
   def handle_call(:await_idle, from, %{active: active} = state) when map_size(active) > 0 do
     {:noreply, %{state | waiters: [from | state.waiters]}}
@@ -133,34 +161,61 @@ defmodule Sxf.Execution.Coordinator do
     case Map.get(state.active, lease_id) do
       %{pid: ^pid, status: :running} = entry ->
         expected = entry.claim.attempt.execution_event_sequence + 1
+        observed_at = state.now_fn.()
 
-        if event.sequence != expected do
-          {:reply, {:error, {:invalid_execution_event_sequence, expected}}, state}
-        else
-          attrs = %{
-            actor_id: entry.context.actor_id,
-            correlation_id: entry.context.correlation_id,
-            observed_at: state.now_fn.()
-          }
+        cond do
+          event.sequence != expected ->
+            {:reply, {:error, {:invalid_execution_event_sequence, expected}}, state}
 
-          case state.task_store.record_event(entry.claim, event, attrs) do
-            {:ok, result} ->
-              claim = %{entry.claim | attempt: result.attempt}
+          deadline_reached?(entry.runtime_deadline_at, observed_at) ->
+            state =
+              begin_control_stop(
+                state,
+                entry,
+                :runtime_timeout,
+                "backend event observed after the durable runtime deadline",
+                observed_at,
+                true
+              )
 
-              state =
-                put_entry(state, %{entry | claim: claim, context: %{entry.context | claim: claim}})
+            {:reply, {:error, :runtime_deadline_reached}, reschedule_control_timer(state)}
 
-              reply =
-                case result.exhausted_metrics do
-                  [] -> :ok
-                  metrics -> {:error, {:budget_exhausted, metrics}}
-                end
+          true ->
+            attrs = %{
+              actor_id: entry.context.actor_id,
+              correlation_id: entry.context.correlation_id,
+              observed_at: observed_at
+            }
 
-              {:reply, reply, state}
+            case state.task_store.record_event(entry.claim, event, attrs) do
+              {:ok, result} ->
+                claim = %{
+                  entry.claim
+                  | attempt: result.attempt,
+                    runtime_deadline_at: result.attempt.runtime_deadline_at
+                }
 
-            {:error, reason} ->
-              {:reply, {:error, reason}, state}
-          end
+                state =
+                  state
+                  |> put_entry(%{
+                    entry
+                    | claim: claim,
+                      context: %{entry.context | claim: claim},
+                      runtime_deadline_at: claim.runtime_deadline_at
+                  })
+                  |> reschedule_control_timer()
+
+                reply =
+                  case result.exhausted_metrics do
+                    [] -> :ok
+                    metrics -> {:error, {:budget_exhausted, metrics}}
+                  end
+
+                {:reply, reply, state}
+
+              {:error, reason} ->
+                {:reply, {:error, reason}, state}
+            end
         end
 
       _ ->
@@ -176,20 +231,33 @@ defmodule Sxf.Execution.Coordinator do
         _ -> state
       end
 
-    {:noreply, state}
+    {:noreply, reschedule_control_timer(state)}
   end
 
   def handle_info({:execution_finished, lease_id, pid, result, cleanup_errors}, state) do
     state =
       case Map.get(state.active, lease_id) do
         %{pid: ^pid, status: :running} = entry ->
-          finish_backend_execution(state, entry, result, cleanup_errors)
+          normalized = normalize_backend_result(result)
+
+          if entry.mode == :resume and normalized.outcome == :backend_unavailable do
+            begin_control_stop(
+              state,
+              entry,
+              :interrupted,
+              "backend resume failed: #{normalized.reason}",
+              state.now_fn.(),
+              true
+            )
+          else
+            finish_backend_execution(state, entry, normalized, cleanup_errors)
+          end
 
         _ ->
           state
       end
 
-    {:noreply, state}
+    {:noreply, reschedule_control_timer(state)}
   end
 
   def handle_info({:control_stop_finished, lease_id, control_pid, details}, state) do
@@ -202,7 +270,7 @@ defmodule Sxf.Execution.Coordinator do
           state
       end
 
-    {:noreply, state}
+    {:noreply, reschedule_control_timer(state)}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
@@ -217,15 +285,17 @@ defmodule Sxf.Execution.Coordinator do
           %{monitor_ref: ^ref, status: :running} = entry ->
             observed_at = state.now_fn.()
 
-            {:noreply,
-             begin_control_stop(
-               state,
-               entry,
-               :interrupted,
-               "supervised execution process exited: #{inspect(reason)}",
-               observed_at,
-               false
-             )}
+            state =
+              begin_control_stop(
+                state,
+                entry,
+                :interrupted,
+                "supervised execution process exited: #{inspect(reason)}",
+                observed_at,
+                false
+              )
+
+            {:noreply, reschedule_control_timer(state)}
 
           _ ->
             {:noreply, state}
@@ -233,10 +303,26 @@ defmodule Sxf.Execution.Coordinator do
     end
   end
 
-  def handle_info(:control_tick, state) do
-    {_results, state} = advance_active(state, state.now_fn.())
-    {:noreply, schedule_control_tick(state)}
+  def handle_info({:control_tick, token}, %{control_timer_token: token} = state) do
+    if state.control_timer_ref, do: Process.cancel_timer(state.control_timer_ref)
+
+    observed_at = state.now_fn.()
+
+    state = %{
+      state
+      | control_timer_ref: nil,
+        control_timer_deadline: nil,
+        control_timer_token: nil
+    }
+
+    {_report, state} = do_reconcile(state, observed_at)
+    {_results, state} = advance_active(state, observed_at)
+
+    {:noreply, state |> reset_reconciliation_deadline(observed_at) |> reschedule_control_timer()}
   end
+
+  def handle_info({:control_tick, _stale_token}, state), do: {:noreply, state}
+  def handle_info(:control_tick, state), do: {:noreply, state}
 
   defp dispatch_once(state, opts) do
     observed_at = state.now_fn.()
@@ -281,11 +367,14 @@ defmodule Sxf.Execution.Coordinator do
     coordinator = self()
 
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           Sxf.Execution.Worker.run(coordinator, context, %{
-             agent: state.agent_backend,
-             workspace: state.workspace_backend,
-             sandbox: state.sandbox_backend
-           })
+           receive do
+             :begin_execution ->
+               Sxf.Execution.Worker.run(coordinator, context, %{
+                 agent: state.agent_backend,
+                 workspace: state.workspace_backend,
+                 sandbox: state.sandbox_backend
+               })
+           end
          end) do
       {:ok, pid} ->
         monitor_ref = Process.monitor(pid)
@@ -297,6 +386,7 @@ defmodule Sxf.Execution.Coordinator do
           monitor_ref: monitor_ref,
           control_pid: nil,
           status: :running,
+          mode: :start,
           dispatch_key: dispatch_key,
           renewal_sequence: claim.renewal_sequence,
           next_renewal_at:
@@ -312,7 +402,9 @@ defmodule Sxf.Execution.Coordinator do
           state
           |> put_entry(entry)
           |> put_monitor(monitor_ref, claim.lease.id)
-          |> schedule_entry_tick(entry)
+          |> reschedule_control_timer()
+
+        send(pid, :begin_execution)
 
         {{:ok, %{status: :accepted, claim: claim}}, state}
 
@@ -347,8 +439,20 @@ defmodule Sxf.Execution.Coordinator do
       case Map.get(state.active, entry.claim.lease.id) do
         %{status: :running} = current ->
           cond do
-            current.runtime_deadline_at &&
-                DateTime.compare(observed_at, current.runtime_deadline_at) != :lt ->
+            deadline_reached?(current.claim.lease.expires_at, observed_at) ->
+              state =
+                begin_control_stop(
+                  state,
+                  current,
+                  :lease_expired,
+                  "durable worker lease expired before renewal",
+                  observed_at,
+                  true
+                )
+
+              {[%{lease_id: current.claim.lease.id, action: :lease_expired} | results], state}
+
+            deadline_reached?(current.runtime_deadline_at, observed_at) ->
               state =
                 begin_control_stop(
                   state,
@@ -396,8 +500,7 @@ defmodule Sxf.Execution.Coordinator do
 
   defp renew_entry(state, entry, observed_at) do
     sequence = entry.renewal_sequence + 1
-    base = max_datetime(entry.claim.lease.expires_at, observed_at)
-    expires_at = DateTime.add(base, state.lease_ttl_ms, :millisecond)
+    expires_at = DateTime.add(observed_at, state.lease_ttl_ms, :millisecond)
 
     attrs = %{
       renewed_at: observed_at,
@@ -419,7 +522,7 @@ defmodule Sxf.Execution.Coordinator do
               DateTime.add(observed_at, state.lease_renewal_interval_ms, :millisecond)
         }
 
-        state = state |> put_entry(entry) |> schedule_entry_tick(entry)
+        state = state |> put_entry(entry) |> reschedule_control_timer()
         {:ok, state}
 
       {:error, reason} ->
@@ -428,8 +531,8 @@ defmodule Sxf.Execution.Coordinator do
   end
 
   defp begin_control_stop(state, %{status: :running} = entry, kind, reason, observed_at, cancel?) do
-    Process.demonitor(entry.monitor_ref, [:flush])
-    _ = Task.Supervisor.terminate_child(state.task_supervisor, entry.pid)
+    if entry.monitor_ref, do: Process.demonitor(entry.monitor_ref, [:flush])
+    if entry.pid, do: Task.Supervisor.terminate_child(state.task_supervisor, entry.pid)
     coordinator = self()
     context = entry.context
 
@@ -461,7 +564,10 @@ defmodule Sxf.Execution.Coordinator do
         })
       end)
 
-    monitors = Map.delete(state.monitors, entry.monitor_ref)
+    monitors =
+      if entry.monitor_ref,
+        do: Map.delete(state.monitors, entry.monitor_ref),
+        else: state.monitors
 
     put_entry(%{state | monitors: monitors}, %{
       entry
@@ -520,8 +626,22 @@ defmodule Sxf.Execution.Coordinator do
 
     result =
       case details.kind do
-        :runtime_timeout -> state.task_store.enforce_runtime_timeout(entry.claim, attrs)
-        :interrupted -> state.task_store.interrupt(entry.claim, attrs)
+        :runtime_timeout ->
+          state.task_store.enforce_runtime_timeout(entry.claim, attrs)
+
+        :interrupted ->
+          state.task_store.interrupt(entry.claim, attrs)
+
+        :lease_expired ->
+          case state.task_store.reconcile_expired(
+                 details.observed_at,
+                 state.actor_id,
+                 entry.context.correlation_id,
+                 []
+               ) do
+            [] -> {:error, :expired_lease_not_reconciled}
+            results -> {:ok, %{expired: results}}
+          end
       end
 
     completion =
@@ -558,55 +678,236 @@ defmodule Sxf.Execution.Coordinator do
         completed: [completion | state.completed]
     }
 
-    if map_size(active) == 0 and state.waiters != [] do
-      reply = {:ok, Enum.reverse(state.completed)}
-      Enum.each(state.waiters, &GenServer.reply(&1, reply))
-      %{state | waiters: [], completed: []}
-    else
-      state
+    state =
+      if map_size(active) == 0 and state.waiters != [] do
+        reply = {:ok, Enum.reverse(state.completed)}
+        Enum.each(state.waiters, &GenServer.reply(&1, reply))
+        %{state | waiters: [], completed: []}
+      else
+        state
+      end
+
+    reschedule_control_timer(state)
+  end
+
+  defp do_reconcile(state, observed_at) do
+    correlation_id = Sxf.Identifiers.generate()
+    locally_owned = Map.keys(state.active)
+
+    expired =
+      state.task_store.reconcile_expired(
+        observed_at,
+        state.actor_id,
+        correlation_id,
+        locally_owned
+      )
+
+    {actions, state} =
+      state.task_store.active_claims(state.worker_id)
+      |> Enum.reject(&Map.has_key?(state.active, &1.lease.id))
+      |> Enum.reduce({[], state}, fn claim, {actions, state} ->
+        {action, state} = reconcile_claim(state, claim, correlation_id)
+        {[action | actions], state}
+      end)
+
+    report =
+      Enum.reduce(actions, %{expired: expired, resumed: [], interrupted: [], errors: []}, fn
+        {:resumed, value}, report -> %{report | resumed: [value | report.resumed]}
+        {:interrupted, value}, report -> %{report | interrupted: [value | report.interrupted]}
+        {:expired, value}, report -> %{report | expired: report.expired ++ value}
+        {:error, value}, report -> %{report | errors: [value | report.errors]}
+      end)
+
+    report =
+      report
+      |> Map.update!(:resumed, &Enum.reverse/1)
+      |> Map.update!(:interrupted, &Enum.reverse/1)
+      |> Map.update!(:errors, &Enum.reverse/1)
+
+    {report, reschedule_control_timer(state)}
+  end
+
+  defp reconcile_claim(state, claim, correlation_id) do
+    context = %Context{
+      claim: claim,
+      actor_id: state.actor_id,
+      correlation_id: correlation_id,
+      started_at: claim.attempt.started_at,
+      options: state.backend_options
+    }
+
+    inspection = safe_backend_call(fn -> state.agent_backend.inspect(context) end)
+    refreshed_at = state.now_fn.()
+
+    case state.task_store.refresh_claim(claim, refreshed_at) do
+      {:ok, refreshed_claim} ->
+        context = %{context | claim: refreshed_claim}
+
+        cond do
+          deadline_reached?(refreshed_claim.runtime_deadline_at, refreshed_at) ->
+            state =
+              start_recovered_stop(
+                state,
+                context,
+                :runtime_timeout,
+                "runtime deadline reached during restart inspection",
+                refreshed_at,
+                cancellation_supported?(state)
+              )
+
+            {{:interrupted, %{claim: refreshed_claim, action: :runtime_timeout}}, state}
+
+          safe_resume?(state, refreshed_claim, inspection) ->
+            case start_resumed_execution(state, context, refreshed_at) do
+              {:ok, state} ->
+                {{:resumed, %{claim: refreshed_claim, action: :resumed}}, state}
+
+              {:error, reason, state} ->
+                state =
+                  start_recovered_stop(
+                    state,
+                    context,
+                    :interrupted,
+                    "failed to start supervised resume worker: #{inspect(reason)}",
+                    refreshed_at,
+                    cancellation_supported?(state)
+                  )
+
+                {{:interrupted, %{claim: refreshed_claim, reason: reason}}, state}
+            end
+
+          true ->
+            reason = restart_interruption_reason(inspection, refreshed_claim)
+
+            state =
+              start_recovered_stop(
+                state,
+                context,
+                :interrupted,
+                reason,
+                refreshed_at,
+                cancellation_supported?(state)
+              )
+
+            {{:interrupted, %{claim: refreshed_claim, reason: reason}}, state}
+        end
+
+      {:error, :stale_backend_event} ->
+        expired =
+          state.task_store.reconcile_expired(
+            refreshed_at,
+            state.actor_id,
+            correlation_id,
+            Map.keys(state.active)
+          )
+
+        {{:expired, expired}, state}
+
+      {:error, reason} ->
+        {{:error, %{claim: claim, reason: reason}}, state}
     end
   end
 
-  defp do_reconcile(state) do
-    observed_at = state.now_fn.()
-    correlation_id = Sxf.Identifiers.generate()
-    expired = state.task_store.reconcile_expired(observed_at, state.actor_id, correlation_id)
+  defp start_resumed_execution(state, %Context{} = context, observed_at) do
+    coordinator = self()
 
-    interrupted =
-      state.task_store.active_claims(state.worker_id)
-      |> Enum.reject(&Map.has_key?(state.active, &1.lease.id))
-      |> Enum.flat_map(fn claim ->
-        context = %Context{
+    case Task.Supervisor.start_child(state.task_supervisor, fn ->
+           receive do
+             :begin_resume ->
+               Sxf.Execution.Worker.resume(coordinator, context, state.agent_backend)
+           end
+         end) do
+      {:ok, pid} ->
+        monitor_ref = Process.monitor(pid)
+        claim = context.claim
+
+        entry = %{
           claim: claim,
-          actor_id: state.actor_id,
-          correlation_id: correlation_id,
-          started_at: claim.attempt.started_at,
-          options: state.backend_options
+          context: context,
+          pid: pid,
+          monitor_ref: monitor_ref,
+          control_pid: nil,
+          status: :running,
+          mode: :resume,
+          dispatch_key: "restart-resume:#{claim.lease.id}",
+          renewal_sequence: claim.renewal_sequence,
+          next_renewal_at:
+            DateTime.add(
+              claim.lease.heartbeat_at || claim.lease.acquired_at,
+              state.lease_renewal_interval_ms,
+              :millisecond
+            ),
+          runtime_deadline_at: claim.runtime_deadline_at,
+          resumed_at: observed_at
         }
 
-        case state.agent_backend.inspect(context) do
-          {:ok, :running} ->
-            []
+        state =
+          state
+          |> put_entry(entry)
+          |> put_monitor(monitor_ref, claim.lease.id)
+          |> reschedule_control_timer()
 
-          _not_running ->
-            attrs = %{
-              actor_id: state.actor_id,
-              occurred_at: observed_at,
-              correlation_id: correlation_id,
-              idempotency_key: "restart-interrupted:#{claim.lease.id}",
-              reason: "coordinator restart found no running backend session"
-            }
+        send(pid, :begin_resume)
+        {:ok, state}
 
-            case state.task_store.interrupt(claim, attrs) do
-              {:ok, result} -> [result]
-              {:error, :stale_backend_event} -> []
-              {:error, reason} -> [%{error: reason, claim: claim}]
-            end
-        end
-      end)
-
-    %{expired: expired, interrupted: interrupted}
+      {:error, reason} ->
+        {:error, reason, state}
+    end
   end
+
+  defp start_recovered_stop(state, context, kind, reason, observed_at, cancel?) do
+    entry = %{
+      claim: context.claim,
+      context: context,
+      pid: nil,
+      monitor_ref: nil,
+      control_pid: nil,
+      status: :running,
+      mode: :resume,
+      dispatch_key: "restart-recovery:#{context.claim.lease.id}",
+      renewal_sequence: context.claim.renewal_sequence,
+      next_renewal_at: nil,
+      runtime_deadline_at: context.claim.runtime_deadline_at
+    }
+
+    state
+    |> put_entry(entry)
+    |> begin_control_stop(entry, kind, reason, observed_at, cancel?)
+    |> reschedule_control_timer()
+  end
+
+  defp safe_resume?(state, claim, {:ok, :running}) do
+    capabilities = safe_backend_call(fn -> state.agent_backend.capabilities() end)
+
+    match?(%{continuation: true}, capabilities) and
+      is_binary(claim.attempt.backend_session_id) and claim.attempt.backend_session_id != ""
+  end
+
+  defp safe_resume?(_state, _claim, _inspection), do: false
+
+  defp cancellation_supported?(state) do
+    match?(%{cancellation: true}, safe_backend_call(fn -> state.agent_backend.capabilities() end))
+  end
+
+  defp restart_interruption_reason({:ok, :running}, claim) do
+    if is_binary(claim.attempt.backend_session_id) and claim.attempt.backend_session_id != "" do
+      "backend continuation is unsupported; running session cannot be safely reattached"
+    else
+      "running backend session has no durable session identity for safe reattachment"
+    end
+  end
+
+  defp restart_interruption_reason({:ok, :finished}, _claim),
+    do: "backend reported finished without a durable accepted completion event"
+
+  defp restart_interruption_reason({:ok, :missing}, _claim),
+    do: "coordinator restart found no running backend session"
+
+  defp restart_interruption_reason({:error, reason}, _claim),
+    do: "backend inspection failed: #{inspect(reason)}"
+
+  defp restart_interruption_reason(other, _claim),
+    do: "backend inspection returned an unknown state: #{inspect(other)}"
 
   defp finish_attrs(state, claim, dispatch_key, correlation_id, reason) do
     %{
@@ -633,6 +934,16 @@ defmodule Sxf.Execution.Coordinator do
             ],
        do: result
 
+  defp normalize_backend_result(%Result{outcome: outcome} = result)
+       when outcome in [
+              :success,
+              :deterministic_failure,
+              :timeout,
+              :cancelled,
+              :backend_unavailable
+            ],
+       do: result
+
   defp normalize_backend_result({:error, reason}),
     do: %Result{outcome: :backend_unavailable, reason: inspect(reason)}
 
@@ -648,28 +959,98 @@ defmodule Sxf.Execution.Coordinator do
   defp put_monitor(state, ref, lease_id),
     do: %{state | monitors: Map.put(state.monitors, ref, lease_id)}
 
-  defp schedule_control_tick(%{automatic_timers: false} = state), do: state
-
-  defp schedule_control_tick(state) do
-    Process.send_after(self(), :control_tick, state.control_tick_ms)
-    state
+  defp reschedule_control_timer(%{automatic_timers: false} = state) do
+    cancel_control_timer(state)
   end
 
-  defp schedule_entry_tick(%{automatic_timers: false} = state, _entry), do: state
+  defp reschedule_control_timer(state) do
+    deadline = next_control_deadline(state)
 
-  defp schedule_entry_tick(state, entry) do
-    deadline =
-      [entry.next_renewal_at, entry.runtime_deadline_at]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.min(DateTime)
+    if deadline == state.control_timer_deadline and is_reference(state.control_timer_ref) do
+      state
+    else
+      state = cancel_control_timer(state)
 
-    delay = max(DateTime.diff(deadline, state.now_fn.(), :millisecond), 0)
-    Process.send_after(self(), :control_tick, delay)
-    state
+      if deadline do
+        token = make_ref()
+        delay = max(DateTime.diff(deadline, state.now_fn.(), :millisecond), 0)
+        ref = Process.send_after(self(), {:control_tick, token}, delay)
+
+        %{
+          state
+          | control_timer_ref: ref,
+            control_timer_deadline: deadline,
+            control_timer_token: token
+        }
+      else
+        state
+      end
+    end
   end
 
-  defp max_datetime(left, right) do
-    if DateTime.compare(left, right) == :lt, do: right, else: left
+  defp cancel_control_timer(%{control_timer_ref: nil} = state), do: state
+
+  defp cancel_control_timer(state) do
+    Process.cancel_timer(state.control_timer_ref)
+
+    %{
+      state
+      | control_timer_ref: nil,
+        control_timer_deadline: nil,
+        control_timer_token: nil
+    }
+  end
+
+  defp next_control_deadline(state) do
+    entry_deadlines =
+      state.active
+      |> Map.values()
+      |> Enum.filter(&(&1.status == :running))
+      |> Enum.flat_map(fn entry ->
+        [entry.next_renewal_at, entry.runtime_deadline_at, entry.claim.lease.expires_at]
+      end)
+
+    [state.next_reconciliation_at | entry_deadlines]
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> nil
+      deadlines -> Enum.min(deadlines, DateTime)
+    end
+  end
+
+  defp reset_reconciliation_deadline(state, observed_at) do
+    %{
+      state
+      | next_reconciliation_at: DateTime.add(observed_at, state.control_tick_ms, :millisecond)
+    }
+  end
+
+  defp deadline_reached?(nil, _observed_at), do: false
+
+  defp deadline_reached?(deadline, observed_at),
+    do: DateTime.compare(observed_at, deadline) != :lt
+
+  defp validate_timing_config(lease_ttl_ms, renewal_interval_ms, control_tick_ms)
+       when is_integer(lease_ttl_ms) and is_integer(renewal_interval_ms) and
+              is_integer(control_tick_ms) do
+    cond do
+      lease_ttl_ms <= 0 -> {:error, :lease_ttl_must_be_positive}
+      renewal_interval_ms <= 0 -> {:error, :lease_renewal_interval_must_be_positive}
+      renewal_interval_ms >= lease_ttl_ms -> {:error, :lease_renewal_interval_must_precede_ttl}
+      control_tick_ms <= 0 -> {:error, :control_tick_must_be_positive}
+      true -> :ok
+    end
+  end
+
+  defp validate_timing_config(_lease_ttl_ms, _renewal_interval_ms, _control_tick_ms),
+    do: {:error, :timing_values_must_be_integers}
+
+  defp safe_backend_call(fun) do
+    fun.()
+  rescue
+    error -> {:error, {:exception, error, __STACKTRACE__}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 end
 
@@ -720,6 +1101,17 @@ defmodule Sxf.Execution.Worker do
           []
         })
     end
+  end
+
+  def resume(coordinator, %Context{} = context, agent_backend) do
+    lease_id = context.claim.lease.id
+
+    emit = fn event ->
+      GenServer.call(coordinator, {:backend_event, lease_id, event}, 30_000)
+    end
+
+    result = safe_call(fn -> agent_backend.resume(context, emit) end)
+    send(coordinator, {:execution_finished, lease_id, self(), result, []})
   end
 
   def cancel(context, agent_backend) do

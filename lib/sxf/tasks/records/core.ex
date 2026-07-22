@@ -156,6 +156,7 @@ defmodule Sxf.Tasks.TaskAttempt do
     field :idempotency_key, :string
     field :request_fingerprint, :string
     field :started_at, :utc_datetime_usec
+    field :runtime_deadline_at, :utc_datetime_usec
     field :finished_at, :utc_datetime_usec
     field :outcome, :string
     field :execution_event_sequence, :integer, default: 0
@@ -179,6 +180,7 @@ defmodule Sxf.Tasks.TaskAttempt do
       :idempotency_key,
       :request_fingerprint,
       :started_at,
+      :runtime_deadline_at,
       :finished_at,
       :outcome,
       :execution_event_sequence,
@@ -195,7 +197,7 @@ defmodule Sxf.Tasks.TaskAttempt do
 
   def event_changeset(attempt, attrs) do
     attempt
-    |> cast(attrs, [:execution_event_sequence, :backend_session_id])
+    |> cast(attrs, [:execution_event_sequence, :backend_session_id, :runtime_deadline_at])
     |> validate_number(:execution_event_sequence, greater_than_or_equal_to: 0)
     |> optimistic_lock(:lock_version)
   end

@@ -85,13 +85,15 @@ defmodule Sxf.Execution.TaskStore do
   alias Sxf.Execution.{Claim, Event}
 
   @callback claim_next(map()) :: {:ok, Claim.t() | nil} | {:error, term()}
+  @callback refresh_claim(Claim.t(), DateTime.t()) :: {:ok, Claim.t()} | {:error, term()}
   @callback renew_lease(Claim.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback record_event(Claim.t(), Event.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback enforce_runtime_timeout(Claim.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback finish(Claim.t(), atom(), map()) :: {:ok, map()} | {:error, term()}
   @callback active_claims(String.t()) :: [Claim.t()]
   @callback interrupt(Claim.t(), map()) :: {:ok, map()} | {:error, term()}
-  @callback reconcile_expired(DateTime.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: [map()]
+  @callback reconcile_expired(DateTime.t(), Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
+              [map()]
 end
 
 defmodule Sxf.Execution.AgentBackend do

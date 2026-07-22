@@ -79,13 +79,17 @@ The control plane must reconcile desired state with observed state after restart
 
 The imported Symphony scheduler's in-memory claims, blocked entries, timers, and retry counters are
 not authoritative and are not started. The SXF coordinator derives work, leases, retry deadlines,
-runtime deadlines, and restart actions from SQLite. Supervised execution children keep backend
-calls outside the coordinator mailbox. Control ticks renew leases and enforce runtime without
-backend cooperation, but their process timer references are never durable state. The coordinator
-rejects stale fenced events using trusted observation time, persists exact event and renewal
-replays, reconciles expired leases, and inspects unexpired sessions only through the agent backend.
-Tracker, workspace, sandbox, and backend observations are reconciliation evidence only. See
-[`EXECUTION_COORDINATOR.md`](EXECUTION_COORDINATOR.md).
+persisted runtime deadlines, and restart actions from SQLite. Supervised execution and resume
+children keep agent calls outside the coordinator mailbox. One owned control timer wakes at the
+earliest active deadline or bounded durable-reconciliation interval; replacement cancels its prior
+reference, and stale timer messages are harmless. Lease expiry remains bounded to one TTL after
+the latest trusted heartbeat, while positive runtime usage can only move the durable deadline
+earlier. On restart or periodic reconciliation, a running session is safely resumed only with
+declared continuation support, a current fenced claim, an unexpired runtime deadline, and a durable
+session ID. Every other observation becomes an explicit interruption, expiry, or timeout with
+bounded retry; no durable active execution remains unowned and unknown state never becomes
+success. Tracker, workspace, sandbox, and backend observations are reconciliation evidence only.
+See [`EXECUTION_COORDINATOR.md`](EXECUTION_COORDINATOR.md).
 
 ## Evidence requirements
 

@@ -3,7 +3,7 @@ defmodule Sxf.Execution.CoordinatorTest do
 
   alias Sxf.Execution.{Claim, Coordinator, Event}
   alias Sxf.Execution.TaskStore.Ecto, as: TaskStore
-  alias Sxf.ExecutionFakes.{Agent, Sandbox, Workspace}
+  alias Sxf.ExecutionFakes.{Agent, AgentWithoutResume, Sandbox, Workspace}
   alias Sxf.Repo
   alias Sxf.Tasks.Task, as: DomainTask
 
@@ -129,7 +129,7 @@ defmodule Sxf.Execution.CoordinatorTest do
     end
   end
 
-  test "an active execution is renewed across multiple deterministic intervals" do
+  test "lease expiry remains exactly one TTL after each trusted renewal heartbeat" do
     fixture = ready_fixture()
     budget_fixture(fixture.task)
     {coordinator, _supervisor} = start_coordinator(fixture, scenario: :blocking, notify: self())
@@ -141,17 +141,20 @@ defmodule Sxf.Execution.CoordinatorTest do
              Coordinator.advance(coordinator, DateTime.add(@execution_time, 10, :second))
 
     first_expiry = Repo.get!(WorkerLease, claim.lease.id).expires_at
+    assert first_expiry == at(40_000)
 
     assert [%{action: :renewed}] =
              Coordinator.advance(coordinator, DateTime.add(@execution_time, 20, :second))
 
-    lease = Repo.get!(WorkerLease, claim.lease.id)
-    assert DateTime.compare(lease.expires_at, first_expiry) == :gt
+    assert Repo.get!(WorkerLease, claim.lease.id).expires_at == at(50_000)
+
+    assert [%{action: :renewed}] = Coordinator.advance(coordinator, at(30_000))
+    assert Repo.get!(WorkerLease, claim.lease.id).expires_at == at(60_000)
 
     assert Enum.map(
              Repo.all(from renewal in LeaseRenewal, order_by: renewal.sequence),
              & &1.sequence
-           ) == [1, 2]
+           ) == [1, 2, 3]
 
     send(worker, :continue)
     assert {:ok, [_]} = Coordinator.await_idle(coordinator)
@@ -171,6 +174,59 @@ defmodule Sxf.Execution.CoordinatorTest do
     assert Repo.aggregate(LeaseRenewal, :count) == 1
   end
 
+  test "lease renewal replay is exact, changed input conflicts, and expiry is a hard fence" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task)
+    {:ok, claim} = TaskStore.claim_next(claim_attrs(fixture, "renewal-replay"))
+
+    attrs = %{
+      renewed_at: at(10_000),
+      expires_at: at(70_000),
+      sequence: 1,
+      idempotency_key: "lease-renewal:#{claim.lease.id}:1"
+    }
+
+    assert {:ok, %{idempotent?: false}} = TaskStore.renew_lease(claim, attrs)
+    assert {:ok, %{idempotent?: true}} = TaskStore.renew_lease(claim, attrs)
+    assert Repo.aggregate(LeaseRenewal, :count) == 1
+
+    assert {:error, :idempotency_conflict} =
+             TaskStore.renew_lease(claim, %{attrs | expires_at: at(70_001)})
+
+    assert {:error, :stale_backend_event} =
+             TaskStore.renew_lease(claim, %{
+               renewed_at: attrs.expires_at,
+               expires_at: at(130_000),
+               sequence: 2,
+               idempotency_key: "lease-renewal:#{claim.lease.id}:2"
+             })
+  end
+
+  test "invalid lease and control timing relationships are rejected at startup" do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    common = [
+      task_store: TaskStore,
+      agent_backend: Agent,
+      workspace_backend: Workspace,
+      sandbox_backend: Sandbox,
+      actor_id: uuid(),
+      worker_id: "invalid-timing"
+    ]
+
+    assert {:error, {:invalid_timing_configuration, :lease_renewal_interval_must_precede_ttl}} =
+             Coordinator.start_link(
+               common ++ [lease_ttl_ms: 10, lease_renewal_interval_ms: 10, control_tick_ms: 1]
+             )
+
+    assert {:error, {:invalid_timing_configuration, :control_tick_must_be_positive}} =
+             Coordinator.start_link(
+               common ++ [lease_ttl_ms: 10, lease_renewal_interval_ms: 5, control_tick_ms: 0]
+             )
+
+    Process.flag(:trap_exit, previous_trap_exit)
+  end
+
   test "stale lease renewal cancels execution and prevents continued authority" do
     fixture = ready_fixture()
     budget_fixture(fixture.task)
@@ -181,7 +237,7 @@ defmodule Sxf.Execution.CoordinatorTest do
     expired_at = DateTime.add(claim.lease.expires_at, 1, :millisecond)
     assert [_] = TaskStore.reconcile_expired(expired_at, fixture.system_actor.id, uuid())
 
-    assert [%{action: :renewal_failed}] = Coordinator.advance(coordinator, expired_at)
+    assert [%{action: :lease_expired}] = Coordinator.advance(coordinator, expired_at)
     assert_receive {:agent_cancelled, attempt_id}
     assert attempt_id == claim.attempt.id
     assert {:ok, [_]} = Coordinator.await_idle(coordinator)
@@ -219,6 +275,87 @@ defmodule Sxf.Execution.CoordinatorTest do
                from usage in UsageEntry,
                  where: usage.task_id == ^fixture.task.id and usage.metric == "runtime_ms"
              )
+  end
+
+  test "positive durable runtime usage refreshes the deadline and stops a later hang at remaining time" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 100_000})
+    event = usage_event(1, %{runtime_ms: 80_000})
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture, scenario: :controllable, notify: self())
+
+    assert {:ok, %{status: :accepted}} = Coordinator.tick(coordinator)
+    assert_receive {:agent_started, worker}
+    send(worker, {:emit, event})
+    assert_receive {:event_emitted, event_id}
+    assert event_id == event.id
+
+    [entry] = :sys.get_state(coordinator).active |> Map.values()
+    assert entry.runtime_deadline_at == at(20_000)
+    assert Repo.get!(TaskAttempt, entry.claim.attempt.id).runtime_deadline_at == at(20_000)
+    assert [%{action: :renewed}] = Coordinator.advance(coordinator, at(19_999))
+    [entry] = :sys.get_state(coordinator).active |> Map.values()
+    assert entry.runtime_deadline_at == at(20_000)
+    assert [%{action: :runtime_timeout}] = Coordinator.advance(coordinator, at(20_000))
+    assert {:ok, [%{outcome: :runtime_timeout}]} = Coordinator.await_idle(coordinator)
+  end
+
+  test "runtime usage replay cannot shorten the durable deadline twice and changed replay conflicts" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 100_000})
+    {:ok, claim} = TaskStore.claim_next(claim_attrs(fixture, "runtime-replay"))
+    event = usage_event(1, %{runtime_ms: 80_000})
+    attrs = event_attrs(fixture, @execution_time)
+
+    assert {:ok, %{idempotent?: false, attempt: attempt}} =
+             TaskStore.record_event(claim, event, attrs)
+
+    assert attempt.runtime_deadline_at == at(20_000)
+
+    assert {:ok, %{idempotent?: true, attempt: replayed_attempt}} =
+             TaskStore.record_event(claim, event, %{attrs | observed_at: at(5_000)})
+
+    assert replayed_attempt.runtime_deadline_at == at(20_000)
+    assert runtime_total(fixture.task.id) == 80_000
+
+    assert {:error, :idempotency_conflict} =
+             TaskStore.record_event(claim, %{event | usage: %{runtime_ms: 80_001}}, attrs)
+  end
+
+  test "lease renewal preserves an earlier refreshed runtime deadline" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 100_000})
+    event = usage_event(1, %{runtime_ms: 80_000})
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture, scenario: :controllable, notify: self())
+
+    assert {:ok, %{status: :accepted}} = Coordinator.tick(coordinator)
+    assert_receive {:agent_started, worker}
+    send(worker, {:emit, event})
+    assert_receive {:event_emitted, _}
+    assert [%{action: :renewed}] = Coordinator.advance(coordinator, at(10_000))
+
+    [entry] = :sys.get_state(coordinator).active |> Map.values()
+    assert entry.runtime_deadline_at == at(20_000)
+    assert entry.claim.lease.expires_at == at(40_000)
+
+    send(worker, :continue)
+    assert {:ok, [_]} = Coordinator.await_idle(coordinator)
+  end
+
+  test "an event observed at the refreshed runtime deadline is rejected durably" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 100_000})
+    {:ok, claim} = TaskStore.claim_next(claim_attrs(fixture, "late-runtime-event"))
+    first = usage_event(1, %{runtime_ms: 80_000})
+    assert {:ok, _} = TaskStore.record_event(claim, first, event_attrs(fixture, @execution_time))
+
+    late = usage_event(2, %{agent_turns: 1}, at(20_000))
+
+    assert {:error, :runtime_deadline_reached} =
+             TaskStore.record_event(claim, late, event_attrs(fixture, at(20_000)))
   end
 
   test "a late backend event after control-plane timeout is rejected" do
@@ -502,11 +639,317 @@ defmodule Sxf.Execution.CoordinatorTest do
 
     {second, _second_supervisor} = start_coordinator(fixture, inspect: :missing)
     assert %{interrupted: [_]} = Coordinator.reconcile(second)
+    assert {:ok, [_]} = Coordinator.await_idle(second)
     assert Repo.get!(DomainTask, fixture.task.id).state == "BLOCKED"
     assert Repo.get_by!(TaskAttempt, task_id: fixture.task.id).status == "lost"
     assert Repo.get_by!(WorkerLease, task_id: fixture.task.id).status == "lost"
     assert Repo.get_by!(RetrySchedule, task_id: fixture.task.id).status == "scheduled"
     assert provider_retry_total(fixture.task.id) == 1
+  end
+
+  test "restart safely resumes a running durable session exactly once without a new claim" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 20_000})
+
+    {first, first_supervisor} =
+      start_coordinator(fixture,
+        scenario: :started_then_hanging,
+        notify: self()
+      )
+
+    assert {:ok, %{status: :accepted, claim: original}} = Coordinator.tick(first)
+    assert_receive {:agent_started, _}
+    assert_receive {:event_emitted, _}
+    stop_coordinator(first, first_supervisor)
+
+    {second, _second_supervisor} =
+      start_coordinator(fixture,
+        inspect: :running,
+        resume_scenario: :hanging,
+        notify: self()
+      )
+
+    assert %{resumed: [%{action: :resumed}]} = Coordinator.reconcile(second)
+    assert_receive {:agent_resumed, resumed_worker}
+    assert %{resumed: [], interrupted: []} = Coordinator.reconcile(second)
+    assert Repo.aggregate(TaskAttempt, :count) == 1
+    assert Repo.aggregate(WorkerLease, :count) == 1
+
+    [entry] = :sys.get_state(second).active |> Map.values()
+    assert entry.mode == :resume
+    assert entry.claim.attempt.id == original.attempt.id
+    assert entry.claim.lease.id == original.lease.id
+    assert entry.claim.lease.fencing_token == original.lease.fencing_token
+    assert entry.claim.attempt.backend_session_id == "fake-session-#{original.attempt.id}"
+
+    assert [%{action: :renewed}] = Coordinator.advance(second, at(10_000))
+    assert [%{action: :runtime_timeout}] = Coordinator.advance(second, at(20_000))
+    assert_receive {:agent_cancelled, attempt_id}
+    assert attempt_id == original.attempt.id
+    assert {:ok, [%{outcome: :runtime_timeout}]} = Coordinator.await_idle(second)
+    refute Process.alive?(resumed_worker)
+  end
+
+  test "unsupported and failed resume become one explicit interrupted retry" do
+    for {suffix, agent_backend, resume_scenario} <- [
+          {"unsupported", AgentWithoutResume, :hanging},
+          {"failed", Agent, :unavailable}
+        ] do
+      fixture = ready_fixture()
+      budget_fixture(fixture.task, %{max_provider_retries: 2})
+      claim = claim_with_session(fixture, "restart-#{suffix}")
+
+      {coordinator, _supervisor} =
+        start_coordinator(fixture,
+          agent_backend: agent_backend,
+          inspect: :running,
+          resume_scenario: resume_scenario,
+          notify: self()
+        )
+
+      report = Coordinator.reconcile(coordinator)
+      assert report.resumed != [] or report.interrupted != []
+      assert {:ok, [_]} = Coordinator.await_idle(coordinator)
+      assert Repo.get!(TaskAttempt, claim.attempt.id).status == "lost"
+      assert Repo.get!(WorkerLease, claim.lease.id).status == "lost"
+      assert provider_retry_total(fixture.task.id) == 1
+
+      assert Repo.aggregate(
+               from(retry in RetrySchedule, where: retry.task_id == ^fixture.task.id),
+               :count
+             ) == 1
+
+      assert %{resumed: [], interrupted: []} = Coordinator.reconcile(coordinator)
+      assert provider_retry_total(fixture.task.id) == 1
+    end
+  end
+
+  test "failed reattachment with no provider retry capacity is explicitly exhausted" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_provider_retries: 0})
+    claim = claim_with_session(fixture, "resume-exhausted")
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture,
+        inspect: :running,
+        resume_scenario: :unavailable
+      )
+
+    assert %{resumed: [_]} = Coordinator.reconcile(coordinator)
+    assert {:ok, [_]} = Coordinator.await_idle(coordinator)
+    assert Repo.get!(TaskAttempt, claim.attempt.id).status == "lost"
+    assert Repo.get_by!(RetrySchedule, task_id: fixture.task.id).status == "exhausted"
+    assert provider_retry_total(fixture.task.id) == 0
+  end
+
+  test "a lease that expires during restart inspection follows durable expiry recovery" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_provider_retries: 2})
+    claim = claim_with_session(fixture, "expiry-during-inspect")
+    {clock, now_fn} = mutable_clock(@execution_time)
+
+    inspect = fn _context ->
+      Elixir.Agent.update(clock, fn _ -> claim.lease.expires_at end)
+      {:ok, :running}
+    end
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture, now_fn: now_fn, inspect: inspect)
+
+    assert %{expired: [_], resumed: []} = Coordinator.reconcile(coordinator)
+    assert Repo.get!(TaskAttempt, claim.attempt.id).status == "lost"
+    assert Repo.get!(WorkerLease, claim.lease.id).status == "expired"
+    assert provider_retry_total(fixture.task.id) == 1
+  end
+
+  test "a stale fencing token cannot be refreshed or reattached" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task)
+    claim = claim_with_session(fixture, "stale-reattach")
+    stale = %{claim | lease: %{claim.lease | fencing_token: claim.lease.fencing_token + 1}}
+
+    assert {:error, :stale_backend_event} = TaskStore.refresh_claim(stale, @execution_time)
+    assert Repo.get!(TaskAttempt, claim.attempt.id).status == "running"
+    assert Repo.get!(WorkerLease, claim.lease.id).status == "active"
+  end
+
+  test "runtime reached during restart inspection uses the control-plane timeout path" do
+    fixture = ready_fixture()
+    budget = budget_fixture(fixture.task, %{max_runtime_ms: 10})
+    claim = claim_with_session(fixture, "runtime-during-inspect")
+    {clock, now_fn} = mutable_clock(@execution_time)
+
+    inspect = fn _context ->
+      Elixir.Agent.update(clock, fn _ -> at(10_000) end)
+      {:ok, :running}
+    end
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture, now_fn: now_fn, inspect: inspect, notify: self())
+
+    assert %{interrupted: [%{action: :runtime_timeout}]} = Coordinator.reconcile(coordinator)
+    assert {:ok, [%{outcome: :runtime_timeout}]} = Coordinator.await_idle(coordinator)
+    assert Repo.get!(Budget, budget.id).status == "exhausted"
+    assert Repo.get!(DomainTask, fixture.task.id).state == "BLOCKED"
+    assert Repo.get!(TaskAttempt, claim.attempt.id).status == "failed"
+  end
+
+  test "finished, unknown, and unavailable inspection states never become success" do
+    for {suffix, inspection} <- [
+          {"finished", :finished},
+          {"unknown", :unknown},
+          {"unavailable", {:error, :unavailable}}
+        ] do
+      fixture = ready_fixture()
+      budget_fixture(fixture.task, %{max_provider_retries: 1})
+      claim = claim_with_session(fixture, "inspection-#{suffix}")
+      {coordinator, _supervisor} = start_coordinator(fixture, inspect: inspection)
+
+      assert %{interrupted: [_]} = Coordinator.reconcile(coordinator)
+      assert {:ok, [_]} = Coordinator.await_idle(coordinator)
+      refute Repo.get!(TaskAttempt, claim.attempt.id).status == "succeeded"
+      refute Repo.get!(DomainTask, fixture.task.id).state == "CI_RUNNING"
+    end
+  end
+
+  test "periodic control reconciliation expires an orphaned durable lease" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_provider_retries: 1})
+    {:ok, claim} = TaskStore.claim_next(claim_attrs(fixture, "periodic-orphan"))
+    {clock, now_fn} = mutable_clock(@execution_time)
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture,
+        now_fn: now_fn,
+        automatic_timers: true,
+        control_tick_ms: 5_000
+      )
+
+    timer = Coordinator.control_timer(coordinator)
+    Elixir.Agent.update(clock, fn _ -> claim.lease.expires_at end)
+    send(coordinator, {:control_tick, timer.token})
+    assert Coordinator.active_count(coordinator) == 0
+    assert Repo.get!(WorkerLease, claim.lease.id).status == "expired"
+    assert Repo.get!(TaskAttempt, claim.attempt.id).status == "lost"
+    assert provider_retry_total(fixture.task.id) == 1
+  end
+
+  test "restart resume reconstructs the persisted remaining-runtime deadline" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 100_000})
+    claim = claim_with_session(fixture, "remaining-runtime", %{runtime_ms: 80_000})
+    assert claim.runtime_deadline_at == at(20_000)
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture,
+        inspect: :running,
+        resume_scenario: :hanging,
+        notify: self()
+      )
+
+    assert %{resumed: [_]} = Coordinator.reconcile(coordinator)
+    assert_receive {:agent_resumed, _}
+    [entry] = :sys.get_state(coordinator).active |> Map.values()
+    assert entry.runtime_deadline_at == at(20_000)
+    assert [%{action: :renewed}] = Coordinator.advance(coordinator, at(19_999))
+    [entry] = :sys.get_state(coordinator).active |> Map.values()
+    assert entry.runtime_deadline_at == at(20_000)
+    assert [%{action: :runtime_timeout}] = Coordinator.advance(coordinator, at(20_000))
+    assert {:ok, [_]} = Coordinator.await_idle(coordinator)
+  end
+
+  test "multiple active executions and an earlier usage deadline retain one owned timer" do
+    first_fixture = ready_fixture()
+    second_fixture = ready_fixture()
+    budget_fixture(first_fixture.task, %{max_runtime_ms: 100_000})
+    budget_fixture(second_fixture.task, %{max_runtime_ms: 100_000})
+
+    {coordinator, _supervisor} =
+      start_coordinator(first_fixture,
+        scenario: :controllable,
+        notify: self(),
+        automatic_timers: true,
+        control_tick_ms: 30_000
+      )
+
+    assert {:ok, %{status: :accepted}} = Coordinator.tick(coordinator)
+    assert_receive {:agent_started, first_worker}
+    first_timer = Coordinator.control_timer(coordinator)
+    assert is_reference(first_timer.ref)
+    assert first_timer.deadline == at(10_000)
+
+    assert {:ok, %{status: :accepted}} = Coordinator.tick(coordinator)
+    assert_receive {:agent_started, second_worker}
+    second_timer = Coordinator.control_timer(coordinator)
+    assert second_timer.ref == first_timer.ref
+    assert Coordinator.active_count(coordinator) == 2
+
+    event = usage_event(1, %{runtime_ms: 95_000})
+    send(first_worker, {:emit, event})
+    assert_receive {:event_emitted, _}
+    earlier_timer = Coordinator.control_timer(coordinator)
+    refute earlier_timer.ref == first_timer.ref
+    assert earlier_timer.deadline == at(5_000)
+    assert Process.read_timer(first_timer.ref) == false
+
+    send(first_worker, :continue)
+    send(second_worker, :continue)
+    assert {:ok, completions} = Coordinator.await_idle(coordinator)
+    assert length(completions) == 2
+
+    reconciliation_timer = Coordinator.control_timer(coordinator)
+    assert is_reference(reconciliation_timer.ref)
+    assert reconciliation_timer.deadline == at(30_000)
+
+    send(coordinator, {:control_tick, earlier_timer.token})
+    assert Coordinator.control_timer(coordinator) == reconciliation_timer
+  end
+
+  test "lease renewal and repeated control ticks replace rather than accumulate timer ownership" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 100_000})
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture,
+        scenario: :hanging,
+        notify: self(),
+        automatic_timers: true,
+        control_tick_ms: 30_000
+      )
+
+    assert {:ok, %{status: :accepted}} = Coordinator.tick(coordinator)
+    assert_receive {:agent_started, _}
+    before_renewal = Coordinator.control_timer(coordinator)
+    assert before_renewal.deadline == at(10_000)
+
+    assert [%{action: :renewed}] = Coordinator.advance(coordinator, at(10_000))
+    after_renewal = Coordinator.control_timer(coordinator)
+    refute after_renewal.ref == before_renewal.ref
+    assert after_renewal.deadline == at(20_000)
+    assert Process.read_timer(before_renewal.ref) == false
+
+    send(coordinator, {:control_tick, before_renewal.token})
+    assert Coordinator.control_timer(coordinator) == after_renewal
+  end
+
+  test "idle periodic control ticks retain only the bounded reconciliation timer" do
+    fixture = ready_fixture()
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture, automatic_timers: true, control_tick_ms: 10_000)
+
+    first = Coordinator.control_timer(coordinator)
+    assert first.deadline == at(10_000)
+    send(coordinator, {:control_tick, first.token})
+    second = Coordinator.control_timer(coordinator)
+    refute second.ref == first.ref
+    assert Process.read_timer(first.ref) == false
+
+    send(coordinator, {:control_tick, second.token})
+    third = Coordinator.control_timer(coordinator)
+    refute third.ref == second.ref
+    assert Process.read_timer(second.ref) == false
+    assert third.deadline == at(10_000)
   end
 
   test "execution event replay is idempotent and semantic changes conflict" do
@@ -587,22 +1030,34 @@ defmodule Sxf.Execution.CoordinatorTest do
   defp start_coordinator(fixture, backend_options) do
     {:ok, task_supervisor} = Task.Supervisor.start_link()
 
+    coordinator_keys = [
+      :agent_backend,
+      :now_fn,
+      :automatic_timers,
+      :control_tick_ms,
+      :lease_ttl_ms,
+      :lease_renewal_interval_ms,
+      :reconcile_on_start
+    ]
+
     {:ok, pid} =
       Coordinator.start_link(
         task_store: TaskStore,
-        agent_backend: Agent,
+        agent_backend: Keyword.get(backend_options, :agent_backend, Agent),
         workspace_backend: Workspace,
         sandbox_backend: Sandbox,
         task_supervisor: task_supervisor,
         actor_id: fixture.system_actor.id,
         worker_id: "coordinator-test",
         backend_name: "fake",
-        lease_ttl_ms: 30_000,
-        lease_renewal_interval_ms: 10_000,
-        now_fn: fn -> @execution_time end,
-        automatic_timers: false,
-        backend_options: backend_options,
-        reconcile_on_start: false
+        lease_ttl_ms: Keyword.get(backend_options, :lease_ttl_ms, 30_000),
+        lease_renewal_interval_ms:
+          Keyword.get(backend_options, :lease_renewal_interval_ms, 10_000),
+        control_tick_ms: Keyword.get(backend_options, :control_tick_ms, 10_000),
+        now_fn: Keyword.get(backend_options, :now_fn, fn -> @execution_time end),
+        automatic_timers: Keyword.get(backend_options, :automatic_timers, false),
+        backend_options: Keyword.drop(backend_options, coordinator_keys),
+        reconcile_on_start: Keyword.get(backend_options, :reconcile_on_start, false)
       )
 
     {pid, task_supervisor}
@@ -631,6 +1086,44 @@ defmodule Sxf.Execution.CoordinatorTest do
         where: usage.task_id == ^task_id and usage.metric == "provider_retries",
         select: coalesce(sum(usage.quantity), 0)
     )
+  end
+
+  defp runtime_total(task_id) do
+    Repo.one(
+      from usage in UsageEntry,
+        where: usage.task_id == ^task_id and usage.metric == "runtime_ms",
+        select: coalesce(sum(usage.quantity), 0)
+    )
+  end
+
+  defp claim_with_session(fixture, suffix, usage \\ %{}) do
+    attrs =
+      fixture
+      |> claim_attrs(suffix)
+      |> Map.put(:expires_at, at(30_000))
+
+    {:ok, claim} = TaskStore.claim_next(attrs)
+    event = %{usage_event(1, usage) | session_id: "session-#{suffix}"}
+    {:ok, result} = TaskStore.record_event(claim, event, event_attrs(fixture, @execution_time))
+
+    %{
+      claim
+      | attempt: result.attempt,
+        runtime_deadline_at: result.attempt.runtime_deadline_at
+    }
+  end
+
+  defp mutable_clock(initial_time) do
+    {:ok, clock} = Elixir.Agent.start_link(fn -> initial_time end)
+    {clock, fn -> Elixir.Agent.get(clock, & &1) end}
+  end
+
+  defp stop_coordinator(coordinator, supervisor) do
+    Process.unlink(coordinator)
+    ref = Process.monitor(coordinator)
+    Process.exit(coordinator, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, :killed}
+    Supervisor.stop(supervisor)
   end
 
   defp at(milliseconds), do: DateTime.add(@execution_time, milliseconds, :millisecond)

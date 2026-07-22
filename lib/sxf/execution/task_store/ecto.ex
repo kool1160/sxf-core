@@ -124,6 +124,21 @@ defmodule Sxf.Execution.TaskStore.Ecto do
   end
 
   @impl true
+  def refresh_claim(%Claim{} = claim, %DateTime{} = observed_at) do
+    Repo.transaction(fn ->
+      lease = validate_active_lease!(claim, observed_at)
+      attempt = Repo.get!(TaskAttempt, claim.attempt.id)
+
+      if attempt.status != "running" do
+        Repo.rollback(:stale_backend_event)
+      end
+
+      load_claim(lease)
+    end)
+    |> flatten()
+  end
+
+  @impl true
   def record_event(%Claim{} = claim, %Event{} = event, attrs) when is_map(attrs) do
     with :ok <- require_keys(attrs, [:actor_id, :correlation_id, :observed_at]) do
       Repo.transaction(fn -> do_record_event(claim, event, attrs) end)
@@ -143,13 +158,16 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       :cleanup_errors
     ]
 
-    with :ok <- require_keys(attrs, required),
-         %DateTime{} = deadline <- claim.runtime_deadline_at || {:error, :runtime_unbounded},
-         true <-
-           DateTime.compare(attrs.observed_at, deadline) != :lt ||
-             {:error, :runtime_deadline_not_reached} do
+    with :ok <- require_keys(attrs, required) do
       Repo.transaction(fn ->
-        remaining = runtime_remaining(claim)
+        attempt = Repo.get!(TaskAttempt, claim.attempt.id)
+        deadline = attempt.runtime_deadline_at || Repo.rollback(:runtime_unbounded)
+
+        if DateTime.compare(attrs.observed_at, deadline) == :lt do
+          Repo.rollback(:runtime_deadline_not_reached)
+        end
+
+        remaining = runtime_remaining(claim.task.id, attempt.id)
 
         timeout_event = %Event{
           id: deterministic_uuid("#{attrs.idempotency_key}:usage"),
@@ -164,7 +182,8 @@ defmodule Sxf.Execution.TaskStore.Ecto do
         do_record_event(claim, timeout_event, %{
           actor_id: attrs.actor_id,
           correlation_id: attrs.correlation_id,
-          observed_at: attrs.observed_at
+          observed_at: attrs.observed_at,
+          allow_runtime_deadline?: true
         })
 
         do_finish(claim, :timeout, %{
@@ -227,8 +246,10 @@ defmodule Sxf.Execution.TaskStore.Ecto do
   end
 
   @impl true
-  def reconcile_expired(observed_at, actor_id, correlation_id) do
-    Tasks.reconcile_expired_leases(observed_at, actor_id, correlation_id)
+  def reconcile_expired(observed_at, actor_id, correlation_id, excluded_lease_ids \\ []) do
+    Tasks.reconcile_expired_leases(observed_at, actor_id, correlation_id,
+      excluded_lease_ids: excluded_lease_ids
+    )
     |> Enum.map(fn
       {:ok, result} -> result
       {:error, reason} -> %{error: reason}
@@ -344,6 +365,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
         status: "running",
         backend: attrs.backend,
         started_at: attrs.occurred_at,
+        runtime_deadline_at: initial_runtime_deadline(task.id, attrs.occurred_at),
         idempotency_key: "#{attrs.idempotency_key}:attempt",
         metadata: if(retry, do: %{retry_schedule_id: retry.id}, else: %{})
       })
@@ -390,7 +412,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       attempt: attempt,
       lease: lease,
       budgets: budgets_for(task.id, attempt.id),
-      runtime_deadline_at: runtime_deadline(task.id, attempt),
+      runtime_deadline_at: attempt.runtime_deadline_at,
       renewal_sequence: 0,
       replayed?: false
     }
@@ -420,7 +442,8 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       attempt: attempt,
       lease: lease,
       budgets: budgets,
-      runtime_deadline_at: runtime_deadline(lease.task_id, attempt),
+      runtime_deadline_at:
+        attempt.runtime_deadline_at || initial_runtime_deadline(lease.task_id, attempt.started_at),
       renewal_sequence:
         Repo.aggregate(
           from(renewal in LeaseRenewal, where: renewal.lease_id == ^lease.id),
@@ -452,6 +475,12 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
         if attempt.status != "running" do
           Repo.rollback(:stale_backend_event)
+        end
+
+        if attempt.runtime_deadline_at &&
+             DateTime.compare(attrs.observed_at, attempt.runtime_deadline_at) != :lt &&
+             not Map.get(attrs, :allow_runtime_deadline?, false) do
+          Repo.rollback(:runtime_deadline_reached)
         end
 
         if event.sequence != attempt.execution_event_sequence + 1 do
@@ -488,12 +517,14 @@ defmodule Sxf.Execution.TaskStore.Ecto do
           |> update!()
 
         exhausted_metrics = persist_usage(claim, event, attrs)
+        {attempt, deadline_changed?} = refresh_runtime_deadline(attempt, event, attrs.observed_at)
 
         %{
           event: persisted,
           attempt: attempt,
           idempotent?: false,
-          exhausted_metrics: exhausted_metrics
+          exhausted_metrics: exhausted_metrics,
+          runtime_deadline_changed?: deadline_changed?
         }
     end
   end
@@ -772,31 +803,65 @@ defmodule Sxf.Execution.TaskStore.Ecto do
   defp limit_for(budget, "repair_cycles"), do: budget.max_repair_cycles
   defp limit_for(budget, "provider_retries"), do: budget.max_provider_retries
 
-  defp runtime_deadline(task_id, attempt) do
-    remaining =
-      budgets_for(task_id, attempt.id)
-      |> Enum.flat_map(fn budget ->
-        case budget.max_runtime_ms do
-          nil -> []
-          limit -> [max(limit - usage_total(budget.id, "runtime_ms"), 0)]
-        end
-      end)
-
-    case remaining do
-      [] -> nil
-      values -> DateTime.add(attempt.started_at, Enum.min(values), :millisecond)
+  defp initial_runtime_deadline(task_id, started_at) do
+    case runtime_remaining(task_id, nil) do
+      nil -> nil
+      remaining -> DateTime.add(started_at, remaining, :millisecond)
     end
   end
 
-  defp runtime_remaining(claim) do
-    claim.budgets
+  defp runtime_remaining(task_id, attempt_id) do
+    budgets_for(task_id, attempt_id)
     |> Enum.flat_map(fn budget ->
       case budget.max_runtime_ms do
         nil -> []
         limit -> [max(limit - usage_total(budget.id, "runtime_ms"), 0)]
       end
     end)
-    |> Enum.min(fn -> 0 end)
+    |> case do
+      [] -> nil
+      values -> Enum.min(values)
+    end
+  end
+
+  defp refresh_runtime_deadline(attempt, event, observed_at) do
+    runtime_delta =
+      event.usage
+      |> normalize_usage()
+      |> Enum.find_value(0, fn
+        {"runtime_ms", quantity} -> quantity
+        _ -> nil
+      end)
+
+    if runtime_delta > 0 do
+      case runtime_remaining(attempt.task_id, attempt.id) do
+        nil ->
+          {attempt, false}
+
+        remaining ->
+          candidate = DateTime.add(observed_at, remaining, :millisecond)
+          deadline = min_datetime(attempt.runtime_deadline_at, candidate)
+
+          if attempt.runtime_deadline_at != deadline do
+            updated =
+              attempt
+              |> TaskAttempt.event_changeset(%{runtime_deadline_at: deadline})
+              |> update!()
+
+            {updated, true}
+          else
+            {attempt, false}
+          end
+      end
+    else
+      {attempt, false}
+    end
+  end
+
+  defp min_datetime(nil, right), do: right
+
+  defp min_datetime(left, right) do
+    if DateTime.compare(left, right) == :gt, do: right, else: left
   end
 
   defp validate_usage!(usage) when is_map(usage) do

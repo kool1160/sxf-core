@@ -354,11 +354,15 @@ defmodule Sxf.Tasks do
   end
 
   @doc "Marks stale leases and attempts, blocks affected tasks, and schedules bounded retries."
-  def reconcile_expired_leases(%DateTime{} = observed_at, actor_id, correlation_id) do
+  def reconcile_expired_leases(%DateTime{} = observed_at, actor_id, correlation_id, opts \\ []) do
+    excluded_lease_ids = Keyword.get(opts, :excluded_lease_ids, [])
+
     leases =
       Repo.all(
         from lease in WorkerLease,
-          where: lease.status == "active" and lease.expires_at <= ^observed_at,
+          where:
+            lease.status == "active" and lease.expires_at <= ^observed_at and
+              lease.id not in ^excluded_lease_ids,
           order_by: [asc: lease.expires_at, asc: lease.id]
       )
 
@@ -1222,6 +1226,7 @@ defmodule Sxf.Tasks do
       backend_session_id: Map.get(attrs, :backend_session_id),
       idempotency_key: attrs.idempotency_key,
       started_at: Map.get(attrs, :started_at),
+      runtime_deadline_at: Map.get(attrs, :runtime_deadline_at),
       finished_at: Map.get(attrs, :finished_at),
       outcome: Map.get(attrs, :outcome),
       metadata: Map.get(attrs, :metadata, %{})
