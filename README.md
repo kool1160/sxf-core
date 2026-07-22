@@ -56,10 +56,13 @@ Idea / Specification / GitHub Issue
 SXF is implementing M3, the first autonomous vertical slice, after completing M1 and M2. The
 repository now contains the initial Elixir/OTP,
 Ecto, and SQLite WAL task domain: stable identities, an explicit lifecycle, transactional transition
-history, attempts, budgets, retries, leases, blockers, decisions, and evidence references. It also
+history, attempts, budgets, retries, leases, blockers, decisions, and evidence references. A
+durable execution coordinator now atomically claims eligible tasks, invokes provider-neutral fake
+agent/workspace/sandbox backends, persists fenced events and usage, enforces limits, and reconciles
+interrupted attempts without starting Symphony as a competing authority. It also
 loads, strictly validates, normalizes, and applies platform policy ceilings to version `0.1` YAML or
 JSON connected-project manifests without executing their commands. It does not yet contain the
-live Symphony scheduler integration, GitHub App integration, agent execution, container workspace
+live agent, GitHub App, repository, or container execution, container workspace
 runtime, or evidence byte store. The pinned Symphony Elixir foundation is retained under
 `upstream/openai-symphony` as a compile-time, default-denied path dependency; it is not started and
 does not replace SXF's durable task authority.
@@ -67,7 +70,8 @@ does not replace SXF's durable task authority.
 See [`AGENTS.md`](AGENTS.md) for repository guidance, [`docs/TASK_DOMAIN.md`](docs/TASK_DOMAIN.md)
 for the durable lifecycle contract, [`docs/PROJECT_MANIFEST.md`](docs/PROJECT_MANIFEST.md) for the
 manifest validation contract, [`docs/UPSTREAM_SYMPHONY.md`](docs/UPSTREAM_SYMPHONY.md) for the
-upstream boundary, and [`docs/`](docs/) for broader product, architecture, reliability, security,
+upstream boundary, [`docs/EXECUTION_COORDINATOR.md`](docs/EXECUTION_COORDINATOR.md) for the M3
+coordinator contract, and [`docs/`](docs/) for broader product, architecture, reliability, security,
 and roadmap documents.
 
 ## Durable-core checks

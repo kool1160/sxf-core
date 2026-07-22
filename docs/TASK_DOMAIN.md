@@ -7,8 +7,8 @@ and worker processes are projections or clients of this model; none is a workflo
 
 ## Scope
 
-The current SXF-owned code provides the smallest durable layer needed before the imported Symphony
-scheduler is adapted:
+The current SXF-owned code provides the durable layer and M3 coordinator needed to adapt accepted
+Symphony execution semantics without starting its orchestrator:
 
 - Ecto schemas and a versioned migration;
 - SQLite configured for WAL mode, foreign keys, immediate write transactions, and a busy timeout;
@@ -16,13 +16,15 @@ scheduler is adapted:
 - a pure lifecycle state machine;
 - transactional task creation and transitions;
 - idempotent attempt, retry, usage, blocker-resolution, and human-decision commands;
-- durable retry deadlines, budgets, usage, leases, blockers, and restart queries; and
+- durable retry deadlines, budgets, usage, leases, fenced execution events, lease renewals,
+  blockers, and restart queries;
+- atomic eligible-task and due-retry claims through provider-neutral execution contracts; and
 - inbox/outbox reference records that reserve integration boundaries without implementing them.
 
-It deliberately does not activate or integrate a scheduler, tracker adapter, agent runtime,
-workspace manager, evidence byte store, webhook processor, external-action dispatcher, or user
-interface. The quarantined upstream source is compiled for conformance only and is not a second
-workflow authority.
+It deliberately activates no live tracker, agent runtime, repository workspace, sandbox, evidence
+byte store, webhook processor, external-action dispatcher, or user interface. The coordinator is
+tested only with deterministic boundary fakes. The quarantined upstream application is compiled
+for conformance only and is not a second workflow authority.
 
 ## Durable records and identity
 
@@ -36,7 +38,7 @@ session IDs are opaque strings attached to stable SXF IDs; they never become pri
 | `repository_registrations` | Stable repository ID plus opaque provider/external identity. Unique by `(provider, external_id)`. |
 | `actors` | Stable identity for a human, system, worker, agent backend, or external system. |
 | `tasks` | Current task projection, saved resume state, terminal timestamp, monotonic transition sequence, and optimistic lock version. |
-| `task_attempts` | Ordered, bounded execution/repair attempt with opaque backend and session references. |
+| `task_attempts` | Ordered, bounded execution/repair attempt with opaque backend/session references and the durable absolute runtime deadline. |
 | `task_transition_events` | Append-oriented prior/result state fact with a task-local sequence, actor, reason, time, correlation, idempotency key, request fingerprint, and any authorizing human-decision reference. |
 | `evidence_references` | Immutable evidence metadata: kind, content hash, storage URI, producer, task/attempt, size, and finalization time. |
 | `event_evidence_references` | Many-to-many attachment of finalized evidence to a transition. |
@@ -44,6 +46,8 @@ session IDs are opaque strings attached to stable SXF IDs; they never become pri
 | `usage_entries` | Append-oriented, idempotent increments against one budget. |
 | `retry_schedules` | Wall-clock `due_at`, sequence, reason, resume state, and durable status. |
 | `worker_leases` | Worker claim, expiry/heartbeat, and monotonically increasing fencing token. |
+| `lease_renewals` | Append-only fingerprinted lease extensions with a monotonic per-lease sequence; each extension must move expiry forward. |
+| `execution_events` | Append-only structured backend facts with attempt-local sequence, lease fencing token, actor, correlation, backend occurrence time, idempotency fingerprint, and payload. Lease authority is checked at trusted control-plane observation time. |
 | `blockers` | Active/resolved stop reason and the state to resume after resolution. |
 | `human_decisions` | Explicit approval, rejection, unblock, cancellation, reopen, deploy, or budget-override decision scoped to one identified transition or blocker-resolution action. |
 | `external_event_inbox_references` | Unique external delivery reference and payload hash for future idempotent intake. |
@@ -61,7 +65,17 @@ the task's project. Every record that carries both `task_id` and `attempt_id` ha
 key to the attempt's `(id, task_id)`, and transition/evidence attachments carry and constrain their
 common task ID. Commands also reject mismatches before attempting a write. Adapter bugs or direct
 database writes therefore cannot associate an attempt, evidence reference, budget, lease, blocker,
-retry, usage entry, transition, or outbox action with a different task.
+retry, usage entry, execution event, lease renewal, transition, or outbox action with a different
+task.
+
+`task_attempts.execution_event_sequence` is the durable projection version for backend events.
+Accepting an event and incrementing that projection happen in one transaction. The next event must
+be exactly one greater. Its lease must be active and unexpired at the control plane's trusted
+`observed_at`, its fencing token must be the newest token for the task, and its attempt must still
+be running. The backend's claimed `occurred_at` is retained as a fact but cannot backdate lease
+authority. Exact replay returns the original row;
+reuse with any different accepted input conflicts. See
+[`EXECUTION_COORDINATOR.md`](EXECUTION_COORDINATOR.md).
 
 ## Authority and transaction boundary
 
@@ -146,8 +160,17 @@ happy-path states are illegal.
   running attempt becomes `lost`, the task becomes `BLOCKED`, and a bounded retry row is scheduled.
   Retry backoff starts at 10 seconds, doubles by sequence, applies deterministic task-derived jitter
   of up to 20 percent, and caps at 300 seconds.
-- If provider-retry capacity is unavailable, the retry row is retained as `exhausted`; the system
-  does not loop or convert the unknown attempt into success.
+- The initial attempt does not consume provider-retry capacity. Each retry after backend
+  unavailability, session interruption, or lease expiry is reserved once in the same transaction
+  that creates its retry row. A limit of N permits exactly N retry attempts after the initial
+  attempt. Exact recovery replay does not reserve twice. If capacity is unavailable, the retry row
+  is retained as `exhausted`; the system does not loop or convert the unknown attempt into success.
+- Active executions receive durable, sequenced lease renewals independently of backend heartbeat.
+  Each renewal expires exactly one configured TTL after its trusted heartbeat. A control-plane
+  runtime deadline is derived from durable attempt timing and the tightest runtime ceiling,
+  persisted on the attempt, and moved only earlier after accepted positive runtime usage. Reaching
+  it records runtime usage and the runtime blocker atomically with attempt and lease finalization;
+  a backend-declared timeout remains a separate backend outcome.
 - `restart_snapshot/1` derives nonterminal tasks, due retries, stale leases, and due pending/unknown
   outbox actions from SQLite only. Scheduler memory may be discarded without losing authority.
 
@@ -164,6 +187,11 @@ human decisions persist their request fingerprint beside the idempotency key. Re
 keys and fingerprints from durable identities such as a lease ID. Budget, inbox, outbox, and lease
 records reserve stable keys or natural unique scopes for their future command handlers. Unknown
 outbox state remains `unknown` until observed; it is never inferred to be successful.
+
+Dispatch-command fingerprints cover accepted semantic input but deliberately exclude fresh
+control-plane observation times, calculated lease expiries, and generated correlation IDs. An
+exact dispatch replay returns the durable claim without repeating external preparation or agent
+execution. Changed accepted dispatch input conflicts.
 
 ## Evidence rules
 

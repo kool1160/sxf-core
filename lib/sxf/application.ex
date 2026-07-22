@@ -5,6 +5,16 @@ defmodule Sxf.Application do
 
   @impl true
   def start(_type, _args) do
-    Supervisor.start_link([Sxf.Repo], strategy: :one_for_one, name: Sxf.Supervisor)
+    children =
+      [Sxf.Repo] ++
+        if Application.get_env(:sxf_core, :execution_coordinator_enabled, false) do
+          [
+            {Sxf.Execution.Supervisor, Application.fetch_env!(:sxf_core, :execution_coordinator)}
+          ]
+        else
+          []
+        end
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: Sxf.Supervisor)
   end
 end

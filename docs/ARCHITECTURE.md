@@ -75,8 +75,11 @@ Selects ready work while respecting repository concurrency, dependencies, rate l
 The pinned Symphony Elixir scheduler is retained at `upstream/openai-symphony/elixir` as an
 Apache-2.0, compile-time path dependency. It is not in the SXF supervision tree. Its dispatch,
 retry, reconciliation, workspace, tracker, and Codex protocol semantics are the adaptation
-baseline, but it cannot claim work until a later integration obtains authority from the durable
-SXF task ledger and lease boundary.
+baseline. The SXF-owned `Sxf.Execution.Coordinator` and SQLite `TaskStore` now provide the only
+claim and reconciliation authority: claim, attempt, lease, and `IMPLEMENTING` transition commit
+atomically; backend events are fenced and sequenced; and due retries are selected from durable
+deadlines. [`EXECUTION_COORDINATOR.md`](EXECUTION_COORDINATOR.md) defines this boundary. Symphony's
+orchestrator remains unsupervised and its process memory never owns workflow state.
 
 ### Workspace manager
 

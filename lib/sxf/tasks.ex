@@ -92,6 +92,42 @@ defmodule Sxf.Tasks do
     end
   end
 
+  @doc "Atomically reserves provider-retry capacity and persists the corresponding retry decision."
+  def schedule_provider_retry(attrs) do
+    required = [
+      :task_id,
+      :attempt_id,
+      :actor_id,
+      :occurred_at,
+      :reason,
+      :resume_state,
+      :correlation_id,
+      :idempotency_key,
+      :outcome
+    ]
+
+    with :ok <- require_keys(attrs, required) do
+      request_fingerprint = provider_retry_fingerprint(attrs)
+
+      Repo.transaction(fn ->
+        case Repo.get_by(RetrySchedule,
+               task_id: attrs.task_id,
+               idempotency_key: attrs.idempotency_key
+             ) do
+          %RetrySchedule{request_fingerprint: ^request_fingerprint} = retry ->
+            %{retry: retry, usage: provider_retry_usage(retry.id), idempotent?: true}
+
+          %RetrySchedule{} ->
+            Repo.rollback(:idempotency_conflict)
+
+          nil ->
+            do_schedule_provider_retry(attrs, request_fingerprint)
+        end
+      end)
+      |> flatten_transaction()
+    end
+  end
+
   @doc "Records an explicit human decision idempotently after validating actor authority."
   def record_human_decision(attrs) do
     required = [
@@ -318,11 +354,15 @@ defmodule Sxf.Tasks do
   end
 
   @doc "Marks stale leases and attempts, blocks affected tasks, and schedules bounded retries."
-  def reconcile_expired_leases(%DateTime{} = observed_at, actor_id, correlation_id) do
+  def reconcile_expired_leases(%DateTime{} = observed_at, actor_id, correlation_id, opts \\ []) do
+    excluded_lease_ids = Keyword.get(opts, :excluded_lease_ids, [])
+
     leases =
       Repo.all(
         from lease in WorkerLease,
-          where: lease.status == "active" and lease.expires_at <= ^observed_at,
+          where:
+            lease.status == "active" and lease.expires_at <= ^observed_at and
+              lease.id not in ^excluded_lease_ids,
           order_by: [asc: lease.expires_at, asc: lease.id]
       )
 
@@ -713,7 +753,7 @@ defmodule Sxf.Tasks do
   end
 
   defp budget_has_capacity?(budget) do
-    Enum.all?(UsageEntry.metrics(), fn metric ->
+    Enum.all?(~w(cost_microusd runtime_ms agent_turns), fn metric ->
       case limit_for(budget, metric) do
         nil -> true
         limit -> usage_total(budget.id, metric) < limit
@@ -858,7 +898,7 @@ defmodule Sxf.Tasks do
           |> Repo.insert()
           |> unwrap_or_rollback()
 
-        exhausted? = not budget_has_capacity?(budget)
+        exhausted? = not metric_has_capacity?(budget, attrs.metric)
 
         if exhausted? do
           budget
@@ -971,7 +1011,19 @@ defmodule Sxf.Tasks do
               metadata: %{blocker_id: blocker.id, lease_id: lease.id}
             })
 
-            persist_recovery_retry(task, attempt, observed_at, correlation_id, lease.id)
+            {:ok, _} =
+              schedule_provider_retry(%{
+                task_id: task.id,
+                attempt_id: attempt.id,
+                actor_id: actor_id,
+                occurred_at: observed_at,
+                reason: "recover from expired worker lease",
+                resume_state: task.state,
+                correlation_id: correlation_id,
+                idempotency_key: "lease-retry:#{lease.id}",
+                outcome: :lease_expired,
+                metadata: %{lease_id: lease.id, worker_id: lease.worker_id}
+              })
           end
 
           %{lease: lease, idempotent?: false}
@@ -980,37 +1032,107 @@ defmodule Sxf.Tasks do
     |> flatten_transaction()
   end
 
-  defp persist_recovery_retry(task, attempt, observed_at, correlation_id, lease_id) do
+  defp do_schedule_provider_retry(attrs, request_fingerprint) do
+    task = Repo.get(Task, attrs.task_id) || Repo.rollback(:task_not_found)
+    attempt = load_attempt(task.id, attrs.attempt_id)
+
     sequence =
-      Repo.one(
-        from retry in RetrySchedule, where: retry.task_id == ^task.id, select: max(retry.sequence)
-      ) || 0
+      (Repo.one(
+         from retry in RetrySchedule,
+           where: retry.task_id == ^task.id,
+           select: max(retry.sequence)
+       ) || 0) + 1
 
-    next_sequence = sequence + 1
-    retry_limit_available? = retry_budget_available?(task.id, attempt.id)
-    status = if retry_limit_available?, do: "scheduled", else: "exhausted"
-    backoff_seconds = retry_backoff_seconds(task.id, next_sequence)
+    retry_budgets =
+      Repo.all(
+        from budget in Budget,
+          where:
+            budget.task_id == ^task.id and
+              (is_nil(budget.attempt_id) or budget.attempt_id == ^attempt.id) and
+              not is_nil(budget.max_provider_retries),
+          order_by: [asc: budget.inserted_at, asc: budget.id]
+      )
 
-    retry_attrs = %{
-      task_id: task.id,
-      attempt_id: attempt.id,
-      sequence: next_sequence,
-      status: status,
-      due_at: DateTime.add(observed_at, backoff_seconds, :second),
-      reason: "recover from expired worker lease",
-      resume_state: task.state,
-      correlation_id: correlation_id,
-      idempotency_key: "lease-retry:#{lease_id}",
-      finished_at: if(status == "exhausted", do: observed_at),
-      metadata: %{lease_id: lease_id, backoff_seconds: backoff_seconds}
-    }
+    capacity? =
+      retry_budgets != [] and
+        Enum.all?(retry_budgets, fn budget ->
+          budget.status == "active" and
+            usage_total(budget.id, "provider_retries") < budget.max_provider_retries
+        end)
 
-    retry_attrs = Map.put(retry_attrs, :request_fingerprint, retry_fingerprint(retry_attrs))
+    status = if capacity?, do: "scheduled", else: "exhausted"
+    backoff_seconds = retry_backoff_seconds(task.id, sequence)
 
-    %RetrySchedule{}
-    |> RetrySchedule.changeset(retry_attrs)
-    |> Repo.insert()
-    |> unwrap_or_rollback()
+    retry =
+      %RetrySchedule{}
+      |> RetrySchedule.changeset(%{
+        task_id: task.id,
+        attempt_id: attempt.id,
+        sequence: sequence,
+        status: status,
+        due_at: DateTime.add(attrs.occurred_at, backoff_seconds, :second),
+        reason: attrs.reason,
+        resume_state: attrs.resume_state,
+        correlation_id: attrs.correlation_id,
+        idempotency_key: attrs.idempotency_key,
+        request_fingerprint: request_fingerprint,
+        finished_at: if(status == "exhausted", do: attrs.occurred_at),
+        metadata:
+          Map.merge(Map.get(attrs, :metadata, %{}), %{
+            backoff_seconds: backoff_seconds,
+            outcome: to_string(attrs.outcome),
+            retry_capacity_reserved: capacity?
+          })
+      })
+      |> Repo.insert()
+      |> unwrap_or_rollback()
+
+    usage =
+      if capacity? do
+        Enum.map(retry_budgets, fn budget ->
+          usage_attrs = %{
+            budget_id: budget.id,
+            task_id: task.id,
+            attempt_id: attempt.id,
+            actor_id: attrs.actor_id,
+            metric: "provider_retries",
+            quantity: 1,
+            occurred_at: attrs.occurred_at,
+            correlation_id: attrs.correlation_id,
+            idempotency_key: "provider-retry:#{retry.id}:#{budget.id}",
+            metadata: %{retry_schedule_id: retry.id, outcome: to_string(attrs.outcome)}
+          }
+
+          %UsageEntry{}
+          |> UsageEntry.changeset(
+            Map.put(usage_attrs, :request_fingerprint, usage_fingerprint(usage_attrs))
+          )
+          |> Repo.insert()
+          |> unwrap_or_rollback()
+        end)
+      else
+        Enum.each(retry_budgets, fn budget ->
+          if budget.status == "active" and
+               usage_total(budget.id, "provider_retries") >= budget.max_provider_retries do
+            budget
+            |> Budget.changeset(%{status: "exhausted"})
+            |> Repo.update()
+            |> unwrap_or_rollback()
+          end
+        end)
+
+        []
+      end
+
+    %{retry: retry, usage: usage, idempotent?: false}
+  end
+
+  defp provider_retry_usage(retry_id) do
+    UsageEntry
+    |> where([usage], usage.metric == "provider_retries")
+    |> order_by([usage], asc: usage.id)
+    |> Repo.all()
+    |> Enum.filter(&(&1.metadata["retry_schedule_id"] == retry_id))
   end
 
   defp retry_backoff_seconds(task_id, sequence) do
@@ -1021,19 +1143,34 @@ defmodule Sxf.Tasks do
     base |> Kernel.+(jitter) |> max(1) |> min(300)
   end
 
-  defp retry_budget_available?(task_id, attempt_id) do
-    applicable_budgets(task_id, attempt_id)
-    |> Enum.any?(fn budget ->
-      is_integer(budget.max_provider_retries) and
-        usage_total(budget.id, "provider_retries") < budget.max_provider_retries
-    end)
-  end
-
   defp limit_for(budget, "cost_microusd"), do: budget.max_cost_microusd
   defp limit_for(budget, "runtime_ms"), do: budget.max_runtime_ms
   defp limit_for(budget, "agent_turns"), do: budget.max_agent_turns
   defp limit_for(budget, "repair_cycles"), do: budget.max_repair_cycles
   defp limit_for(budget, "provider_retries"), do: budget.max_provider_retries
+
+  defp metric_has_capacity?(budget, metric) do
+    case limit_for(budget, metric) do
+      nil -> true
+      limit -> usage_total(budget.id, metric) < limit
+    end
+  end
+
+  defp provider_retry_fingerprint(attrs) do
+    fingerprint(%{
+      command: :schedule_provider_retry,
+      task_id: attrs.task_id,
+      attempt_id: attrs.attempt_id,
+      actor_id: attrs.actor_id,
+      occurred_at: attrs.occurred_at,
+      reason: attrs.reason,
+      resume_state: attrs.resume_state,
+      correlation_id: attrs.correlation_id,
+      idempotency_key: attrs.idempotency_key,
+      outcome: attrs.outcome,
+      metadata: Map.get(attrs, :metadata, %{})
+    })
+  end
 
   defp creation_fingerprint(attrs) do
     fingerprint(%{
@@ -1089,6 +1226,7 @@ defmodule Sxf.Tasks do
       backend_session_id: Map.get(attrs, :backend_session_id),
       idempotency_key: attrs.idempotency_key,
       started_at: Map.get(attrs, :started_at),
+      runtime_deadline_at: Map.get(attrs, :runtime_deadline_at),
       finished_at: Map.get(attrs, :finished_at),
       outcome: Map.get(attrs, :outcome),
       metadata: Map.get(attrs, :metadata, %{})

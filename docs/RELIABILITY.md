@@ -78,9 +78,21 @@ The control plane must reconcile desired state with observed state after restart
 - Rate-limit suspension and recovery.
 
 The imported Symphony scheduler's in-memory claims, blocked entries, timers, and retry counters are
-not authoritative and are not started by this import. Later scheduler adaptation must derive work,
-leases, retry deadlines, and restart actions from SQLite and treat tracker/workspace observations as
-reconciliation evidence only.
+not authoritative and are not started. The SXF coordinator derives work, leases, retry deadlines,
+persisted runtime deadlines, and restart actions from SQLite. Supervised execution and resume
+children keep agent calls outside the coordinator mailbox. One owned control timer wakes at the
+earliest active deadline or bounded durable-reconciliation interval; replacement cancels its prior
+reference, and stale timer messages are harmless. Lease expiry remains bounded to one TTL after
+the latest trusted heartbeat, while positive runtime usage can only move the durable deadline
+earlier. On restart or periodic reconciliation, a running session is safely resumed only with
+declared continuation support, a current fenced claim, an unexpired runtime deadline, and a durable
+session ID. Every other observation becomes an explicit interruption, expiry, or timeout with
+bounded retry; no durable active execution remains unowned and unknown state never becomes
+success. Backend completion uses its trusted control-plane observation time to arbitrate against
+the persisted deadline in the durable transaction; timer delivery order cannot admit an on- or
+after-deadline result. Tracker, workspace, sandbox, and backend observations are reconciliation
+evidence only.
+See [`EXECUTION_COORDINATOR.md`](EXECUTION_COORDINATOR.md).
 
 ## Evidence requirements
 
