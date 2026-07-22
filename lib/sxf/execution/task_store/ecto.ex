@@ -5,7 +5,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
   import Ecto.Query
 
-  alias Sxf.Execution.{Claim, Event}
+  alias Sxf.Execution.{Claim, Event, Result}
   alias Sxf.Repo
   alias Sxf.Tasks
 
@@ -159,47 +159,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     ]
 
     with :ok <- require_keys(attrs, required) do
-      Repo.transaction(fn ->
-        attempt = Repo.get!(TaskAttempt, claim.attempt.id)
-        deadline = attempt.runtime_deadline_at || Repo.rollback(:runtime_unbounded)
-
-        if DateTime.compare(attrs.observed_at, deadline) == :lt do
-          Repo.rollback(:runtime_deadline_not_reached)
-        end
-
-        remaining = runtime_remaining(claim.task.id, attempt.id)
-
-        timeout_event = %Event{
-          id: deterministic_uuid("#{attrs.idempotency_key}:usage"),
-          idempotency_key: "#{attrs.idempotency_key}:usage",
-          sequence: claim.attempt.execution_event_sequence + 1,
-          kind: :usage,
-          occurred_at: deadline,
-          payload: %{source: "control_plane_runtime_deadline"},
-          usage: %{runtime_ms: remaining}
-        }
-
-        do_record_event(claim, timeout_event, %{
-          actor_id: attrs.actor_id,
-          correlation_id: attrs.correlation_id,
-          observed_at: attrs.observed_at,
-          allow_runtime_deadline?: true
-        })
-
-        do_finish(claim, :timeout, %{
-          actor_id: attrs.actor_id,
-          occurred_at: attrs.observed_at,
-          correlation_id: attrs.correlation_id,
-          idempotency_key: attrs.idempotency_key,
-          reason: attrs.reason,
-          metadata: %{
-            timeout_source: "control_plane",
-            runtime_deadline_at: deadline,
-            cancellation: attrs.cancellation,
-            cleanup_errors: attrs.cleanup_errors
-          }
-        })
-      end)
+      Repo.transaction(fn -> do_runtime_timeout(claim, attrs) end)
       |> flatten()
     end
   end
@@ -212,11 +172,12 @@ defmodule Sxf.Execution.TaskStore.Ecto do
            require_keys(attrs, [
              :actor_id,
              :occurred_at,
+             :observed_at,
              :correlation_id,
              :idempotency_key,
              :reason
            ]) do
-      Repo.transaction(fn -> do_finish(claim, outcome, attrs) end)
+      Repo.transaction(fn -> do_finish_with_runtime_boundary(claim, outcome, attrs) end)
       |> flatten()
     end
   end
@@ -556,8 +517,114 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     |> Enum.sort()
   end
 
-  defp do_finish(claim, outcome, attrs) do
+  defp do_finish_with_runtime_boundary(claim, outcome, attrs) do
     request_fingerprint = finish_fingerprint(claim, outcome, attrs)
+
+    case Repo.get_by(ExecutionEvent,
+           task_id: claim.task.id,
+           idempotency_key: attrs.idempotency_key
+         ) do
+      %ExecutionEvent{request_fingerprint: ^request_fingerprint} = completion ->
+        current_result(claim, true)
+        |> Map.merge(completion_boundary_replay(completion))
+
+      %ExecutionEvent{} ->
+        Repo.rollback(:idempotency_conflict)
+
+      nil ->
+        attempt = Repo.get!(TaskAttempt, claim.attempt.id)
+
+        if runtime_deadline_reached?(attempt.runtime_deadline_at, attrs.observed_at) do
+          timeout_attrs = %{
+            actor_id: attrs.actor_id,
+            observed_at: attrs.observed_at,
+            correlation_id: attrs.correlation_id,
+            idempotency_key: attrs.idempotency_key,
+            reason: "backend completion observed at or after durable runtime deadline",
+            cancellation: %{attempted: false, result: :backend_already_finished},
+            cleanup_errors: get_in(attrs, [:metadata, :cleanup_errors]) || [],
+            timeout_source: "control_plane_completion_boundary",
+            rejected_backend_outcome: outcome,
+            rejected_backend_reason: attrs.reason,
+            rejected_backend_metadata: Map.get(attrs, :metadata, %{})
+          }
+
+          do_runtime_timeout(claim, timeout_attrs, request_fingerprint)
+          |> Map.merge(%{deadline_won?: true, requested_outcome: outcome})
+        else
+          do_finish(claim, outcome, attrs, request_fingerprint)
+          |> Map.put(:deadline_won?, false)
+        end
+    end
+  end
+
+  defp do_runtime_timeout(claim, attrs, completion_request_fingerprint \\ nil) do
+    attempt = Repo.get!(TaskAttempt, claim.attempt.id)
+    deadline = attempt.runtime_deadline_at || Repo.rollback(:runtime_unbounded)
+
+    if DateTime.compare(attrs.observed_at, deadline) == :lt do
+      Repo.rollback(:runtime_deadline_not_reached)
+    end
+
+    remaining = runtime_remaining(claim.task.id, attempt.id)
+
+    if remaining > 0 do
+      timeout_event = %Event{
+        id: deterministic_uuid("#{attrs.idempotency_key}:usage"),
+        idempotency_key: "#{attrs.idempotency_key}:usage",
+        sequence: attempt.execution_event_sequence + 1,
+        kind: :usage,
+        occurred_at: deadline,
+        payload: %{source: "control_plane_runtime_deadline"},
+        usage: %{runtime_ms: remaining}
+      }
+
+      do_record_event(claim, timeout_event, %{
+        actor_id: attrs.actor_id,
+        correlation_id: attrs.correlation_id,
+        observed_at: attrs.observed_at,
+        allow_runtime_deadline?: true
+      })
+    end
+
+    timeout_source = Map.get(attrs, :timeout_source, "control_plane")
+
+    metadata = %{
+      timeout_source: timeout_source,
+      runtime_deadline_at: deadline,
+      cancellation: attrs.cancellation,
+      cleanup_errors: attrs.cleanup_errors
+    }
+
+    metadata =
+      if timeout_source == "control_plane_completion_boundary" do
+        Map.merge(metadata, %{
+          rejected_backend_outcome: to_string(attrs.rejected_backend_outcome),
+          rejected_backend_reason: attrs.rejected_backend_reason,
+          rejected_backend_metadata: attrs.rejected_backend_metadata
+        })
+      else
+        metadata
+      end
+
+    do_finish(
+      claim,
+      :timeout,
+      %{
+        actor_id: attrs.actor_id,
+        occurred_at: attrs.observed_at,
+        observed_at: attrs.observed_at,
+        correlation_id: attrs.correlation_id,
+        idempotency_key: attrs.idempotency_key,
+        reason: attrs.reason,
+        metadata: metadata
+      },
+      completion_request_fingerprint
+    )
+  end
+
+  defp do_finish(claim, outcome, attrs, request_fingerprint \\ nil) do
+    request_fingerprint = request_fingerprint || finish_fingerprint(claim, outcome, attrs)
 
     case Repo.get_by(ExecutionEvent,
            task_id: claim.task.id,
@@ -902,6 +969,29 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
   defp validate_renewal_times(_attrs), do: {:error, :invalid_claim_time}
 
+  defp runtime_deadline_reached?(nil, _observed_at), do: false
+
+  defp runtime_deadline_reached?(%DateTime{} = deadline, %DateTime{} = observed_at) do
+    DateTime.compare(observed_at, deadline) != :lt
+  end
+
+  defp completion_boundary_replay(%ExecutionEvent{payload: payload}) do
+    timeout_source = payload["timeout_source"] || payload[:timeout_source]
+
+    if timeout_source == "control_plane_completion_boundary" do
+      requested_outcome =
+        payload["rejected_backend_outcome"] || payload[:rejected_backend_outcome]
+
+      %{
+        deadline_won?: true,
+        requested_outcome:
+          Enum.find(Result.outcomes(), &(Atom.to_string(&1) == requested_outcome))
+      }
+    else
+      %{deadline_won?: false}
+    end
+  end
+
   defp event_fingerprint(claim, event, attrs) do
     fingerprint(%{
       command: :record_execution_event,
@@ -925,6 +1015,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       outcome: outcome,
       actor_id: attrs.actor_id,
       occurred_at: attrs.occurred_at,
+      observed_at: attrs.observed_at,
       correlation_id: attrs.correlation_id,
       idempotency_key: attrs.idempotency_key,
       reason: attrs.reason,

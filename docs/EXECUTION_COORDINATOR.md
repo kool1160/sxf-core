@@ -108,7 +108,14 @@ execution child, calls `AgentBackend.cancel/1` exactly once for that controlled 
 prepared resources, records the remaining runtime usage exactly once, exhausts the budget, creates
 the runtime blocker, finalizes the attempt and lease, and leaves the task `BLOCKED`. Cancellation
 and cleanup failures remain structured completion metadata; neither can turn the primary outcome
-into success. An event first observed at or after the deadline is rejected. Later events are stale.
+into success. Backend completion and the timer path arbitrate against the same persisted deadline
+inside the task-store transaction: `observed_at < runtime_deadline_at` accepts the backend result,
+while `observed_at >= runtime_deadline_at` durably becomes a control-plane timeout. This rule is
+independent of mailbox order, so a completion message dequeued before the timer at the boundary
+cannot become success. The rejected backend outcome remains structured timeout metadata, exact
+replay is idempotent, changed replay conflicts, and a later timer or backend message cannot record
+the outcome twice. An event first observed at or after the deadline is rejected. Later events are
+stale.
 
 The initial execution attempt consumes no provider retry. Backend unavailability, an interrupted
 session, and an expired lease all call one durable provider-retry command. In the same transaction,

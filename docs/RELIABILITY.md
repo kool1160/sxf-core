@@ -88,7 +88,10 @@ earlier. On restart or periodic reconciliation, a running session is safely resu
 declared continuation support, a current fenced claim, an unexpired runtime deadline, and a durable
 session ID. Every other observation becomes an explicit interruption, expiry, or timeout with
 bounded retry; no durable active execution remains unowned and unknown state never becomes
-success. Tracker, workspace, sandbox, and backend observations are reconciliation evidence only.
+success. Backend completion uses its trusted control-plane observation time to arbitrate against
+the persisted deadline in the durable transaction; timer delivery order cannot admit an on- or
+after-deadline result. Tracker, workspace, sandbox, and backend observations are reconciliation
+evidence only.
 See [`EXECUTION_COORDINATOR.md`](EXECUTION_COORDINATOR.md).
 
 ## Evidence requirements

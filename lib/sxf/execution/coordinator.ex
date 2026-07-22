@@ -587,9 +587,9 @@ defmodule Sxf.Execution.Coordinator do
         entry.claim,
         entry.dispatch_key,
         entry.context.correlation_id,
-        result.reason || Atom.to_string(result.outcome)
+        result.reason || Atom.to_string(result.outcome),
+        observed_at
       )
-      |> Map.put(:occurred_at, observed_at)
       |> Map.put(:metadata, %{
         timeout_source: if(result.outcome == :timeout, do: "backend_declared", else: nil),
         cleanup_errors: cleanup_errors
@@ -597,6 +597,15 @@ defmodule Sxf.Execution.Coordinator do
 
     completion =
       case state.task_store.finish(entry.claim, result.outcome, attrs) do
+        {:ok, %{deadline_won?: true} = durable} ->
+          %{
+            claim: entry.claim,
+            outcome: :runtime_timeout,
+            backend_outcome: result,
+            durable: durable,
+            cleanup_errors: cleanup_errors
+          }
+
         {:ok, durable} ->
           %{claim: entry.claim, outcome: result, durable: durable, cleanup_errors: cleanup_errors}
 
@@ -909,10 +918,13 @@ defmodule Sxf.Execution.Coordinator do
   defp restart_interruption_reason(other, _claim),
     do: "backend inspection returned an unknown state: #{inspect(other)}"
 
-  defp finish_attrs(state, claim, dispatch_key, correlation_id, reason) do
+  defp finish_attrs(state, claim, dispatch_key, correlation_id, reason, observed_at \\ nil) do
+    observed_at = observed_at || state.now_fn.()
+
     %{
       actor_id: state.actor_id,
-      occurred_at: state.now_fn.(),
+      occurred_at: observed_at,
+      observed_at: observed_at,
       correlation_id: correlation_id,
       idempotency_key: "#{dispatch_key}:finish",
       reason: reason,

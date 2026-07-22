@@ -358,6 +358,147 @@ defmodule Sxf.Execution.CoordinatorTest do
              TaskStore.record_event(claim, late, event_attrs(fixture, at(20_000)))
   end
 
+  test "backend completion observed strictly before the durable runtime deadline is accepted" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 100})
+    {:ok, claim} = TaskStore.claim_next(claim_attrs(fixture, "completion-before-deadline"))
+    attrs = finish_attrs(fixture, "completion-before-deadline", at(99))
+
+    assert {:ok, %{deadline_won?: false}} = TaskStore.finish(claim, :success, attrs)
+    assert Repo.get!(TaskAttempt, claim.attempt.id).status == "succeeded"
+    assert Repo.get!(DomainTask, fixture.task.id).state == "CI_RUNNING"
+    assert Repo.get_by!(ExecutionEvent, task_id: fixture.task.id).kind == "completed"
+  end
+
+  for {label, observed_milliseconds} <- [{"at", 100}, {"after", 101}] do
+    test "backend completion observed #{label} the durable runtime deadline becomes timeout" do
+      fixture = ready_fixture()
+      budget = budget_fixture(fixture.task, %{max_runtime_ms: 100})
+
+      {:ok, claim} =
+        TaskStore.claim_next(claim_attrs(fixture, "completion-#{unquote(label)}-deadline"))
+
+      attrs =
+        finish_attrs(
+          fixture,
+          "completion-#{unquote(label)}-deadline",
+          at(unquote(observed_milliseconds))
+        )
+
+      assert {:ok, %{deadline_won?: true, requested_outcome: :success}} =
+               TaskStore.finish(claim, :success, attrs)
+
+      assert Repo.get!(TaskAttempt, claim.attempt.id).status == "failed"
+      assert Repo.get!(TaskAttempt, claim.attempt.id).outcome == "timeout"
+      assert Repo.get!(WorkerLease, claim.lease.id).status == "released"
+      assert Repo.get!(DomainTask, fixture.task.id).state == "BLOCKED"
+      assert Repo.get!(Budget, budget.id).status == "exhausted"
+      assert runtime_total(fixture.task.id) == 100
+
+      completion =
+        Repo.get_by!(ExecutionEvent, task_id: fixture.task.id, kind: "timed_out")
+
+      assert completion.payload["timeout_source"] == "control_plane_completion_boundary"
+      assert completion.payload["rejected_backend_outcome"] == "success"
+    end
+  end
+
+  test "deadline-winning backend completion replay is exact and changed input conflicts" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 100})
+    {:ok, claim} = TaskStore.claim_next(claim_attrs(fixture, "late-completion-replay"))
+    attrs = finish_attrs(fixture, "late-completion-replay", at(100))
+
+    assert {:ok, %{deadline_won?: true, idempotent?: false}} =
+             TaskStore.finish(claim, :success, attrs)
+
+    assert {:ok, %{deadline_won?: true, idempotent?: true}} =
+             TaskStore.finish(claim, :success, attrs)
+
+    assert runtime_total(fixture.task.id) == 100
+    assert Repo.aggregate(ExecutionEvent, :count) == 2
+
+    assert {:error, :idempotency_conflict} =
+             TaskStore.finish(claim, :success, %{attrs | observed_at: at(101)})
+
+    assert {:error, :idempotency_conflict} =
+             TaskStore.finish(claim, :deterministic_failure, attrs)
+  end
+
+  test "completion-first mailbox order still gives the deadline to control-plane timeout" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 20_000})
+    {clock, now_fn} = mutable_clock(@execution_time)
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture,
+        scenario: :controllable,
+        notify: self(),
+        now_fn: now_fn,
+        automatic_timers: true
+      )
+
+    assert {:ok, %{status: :accepted, claim: claim}} =
+             Coordinator.tick(coordinator,
+               idempotency_key: "dispatch:completion-first",
+               correlation_id: uuid()
+             )
+
+    assert_receive {:agent_started, worker}
+    timer = Coordinator.control_timer(coordinator)
+    monitor = Process.monitor(worker)
+    :ok = :sys.suspend(coordinator)
+    Elixir.Agent.update(clock, fn _ -> claim.runtime_deadline_at end)
+    send(worker, :continue)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}
+    send(coordinator, {:control_tick, timer.token})
+    :ok = :sys.resume(coordinator)
+
+    assert {:ok, [%{outcome: :runtime_timeout, durable: %{deadline_won?: true}}]} =
+             Coordinator.await_idle(coordinator)
+
+    assert Repo.get!(DomainTask, fixture.task.id).state == "BLOCKED"
+    assert Repo.get!(TaskAttempt, claim.attempt.id).outcome == "timeout"
+    assert runtime_total(fixture.task.id) == 20_000
+    assert Repo.aggregate(ExecutionEvent, :count) == 2
+  end
+
+  test "timer-first mailbox order times out once and ignores the queued backend completion" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 20_000})
+    {clock, now_fn} = mutable_clock(@execution_time)
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture,
+        scenario: :controllable,
+        notify: self(),
+        now_fn: now_fn,
+        automatic_timers: true
+      )
+
+    assert {:ok, %{status: :accepted, claim: claim}} =
+             Coordinator.tick(coordinator,
+               idempotency_key: "dispatch:timer-first",
+               correlation_id: uuid()
+             )
+
+    assert_receive {:agent_started, worker}
+    timer = Coordinator.control_timer(coordinator)
+    monitor = Process.monitor(worker)
+    :ok = :sys.suspend(coordinator)
+    Elixir.Agent.update(clock, fn _ -> claim.runtime_deadline_at end)
+    send(coordinator, {:control_tick, timer.token})
+    send(worker, :continue)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}
+    :ok = :sys.resume(coordinator)
+
+    assert {:ok, [%{outcome: :runtime_timeout}]} = Coordinator.await_idle(coordinator)
+    assert Repo.get!(DomainTask, fixture.task.id).state == "BLOCKED"
+    assert Repo.get!(TaskAttempt, claim.attempt.id).outcome == "timeout"
+    assert runtime_total(fixture.task.id) == 20_000
+    assert Repo.aggregate(ExecutionEvent, :count) == 2
+  end
+
   test "a late backend event after control-plane timeout is rejected" do
     fixture = ready_fixture()
     budget_fixture(fixture.task, %{max_runtime_ms: 25})
@@ -590,11 +731,11 @@ defmodule Sxf.Execution.CoordinatorTest do
     assert Repo.get!(DomainTask, fixture.task.id).state == "BLOCKED"
   end
 
-  for {metric, limit, blocker_kind} <- [
-        {:runtime_ms, 10, "runtime_exhausted"},
-        {:agent_turns, 2, "budget_exhausted"},
-        {:cost_microusd, 25, "budget_exhausted"},
-        {:repair_cycles, 1, "budget_exhausted"}
+  for {metric, limit, blocker_kind, expected_outcome} <- [
+        {:runtime_ms, 10, "runtime_exhausted", :runtime_timeout},
+        {:agent_turns, 2, "budget_exhausted", :deterministic_failure},
+        {:cost_microusd, 25, "budget_exhausted", :deterministic_failure},
+        {:repair_cycles, 1, "budget_exhausted", :deterministic_failure}
       ] do
     test "#{metric} event ceiling blocks the task durably" do
       fixture = ready_fixture()
@@ -602,7 +743,9 @@ defmodule Sxf.Execution.CoordinatorTest do
       event = usage_event(1, %{unquote(metric) => unquote(limit)})
       {coordinator, _supervisor} = start_coordinator(fixture, events: [event])
 
-      assert %{outcome: %{outcome: :deterministic_failure}} = dispatch_and_wait(coordinator)
+      assert %{outcome: unquote(expected_outcome)} =
+               normalize_completion(dispatch_and_wait(coordinator))
+
       assert Repo.get!(DomainTask, fixture.task.id).state == "BLOCKED"
       assert Repo.get_by!(Blocker, task_id: fixture.task.id).kind == unquote(blocker_kind)
 
@@ -1017,6 +1160,7 @@ defmodule Sxf.Execution.CoordinatorTest do
     %{
       actor_id: fixture.system_actor.id,
       occurred_at: occurred_at,
+      observed_at: occurred_at,
       correlation_id: uuid(),
       idempotency_key: "finish:#{suffix}",
       reason: suffix
@@ -1026,6 +1170,11 @@ defmodule Sxf.Execution.CoordinatorTest do
   defp event_attrs(fixture, observed_at) do
     %{actor_id: fixture.system_actor.id, correlation_id: uuid(), observed_at: observed_at}
   end
+
+  defp normalize_completion(%{outcome: %{outcome: outcome}} = completion),
+    do: %{completion | outcome: outcome}
+
+  defp normalize_completion(completion), do: completion
 
   defp start_coordinator(fixture, backend_options) do
     {:ok, task_supervisor} = Task.Supervisor.start_link()
