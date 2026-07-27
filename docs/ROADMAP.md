@@ -10,7 +10,10 @@ The roadmap is organized around working vertical slices. SXF should prove one re
 
 - M1 — complete: the Symphony foundation decision is accepted and merged.
 - M2 — complete: the durable core and connected-project manifest contract are accepted and merged.
-- M3 — active: the next implementation target is [Issue #4](https://github.com/kool1160/sxf-core/issues/4), “Build the first single-repository execution vertical slice.”
+- M3 — active: [Issue #4](https://github.com/kool1160/sxf-core/issues/4), “Build the first
+  single-repository execution vertical slice,” remains the milestone target. Its current bounded
+  prerequisite is [Issue #23](https://github.com/kool1160/sxf-core/issues/23), which records the
+  local GitHub App polling and intake boundary before live integration begins.
 
 ## Phase 0 — Foundation
 
@@ -25,7 +28,8 @@ Goal: take one well-specified GitHub issue in a test repository from `READY` to 
 
 - Local control-plane service.
 - Durable task and attempt state.
-- GitHub issue intake.
+- Idempotent local GitHub App polling for `sxf:ready` issues through the durable inbox, as selected
+  by [ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md).
 - One isolated workspace at a time.
 - One coding-agent backend.
 - Repository command execution.
