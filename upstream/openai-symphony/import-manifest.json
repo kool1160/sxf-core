@@ -846,8 +846,8 @@
       "upstreamRepository": "https://github.com/openai/symphony.git"
     },
     {
-      "importedContentSha256": "39c88b19024d067e482953712696b73297988b276de1cc92bd5d84b85f4a8b7e",
-      "importedGitBlobSha": "210b019c29ca7fb0516a96e5f88daf1afee1bf73",
+      "importedContentSha256": "8589ebef1c8cb660055b54f0aee467bdd8b0f5da844bd00b5318fd6731b3b305",
+      "importedGitBlobSha": "25478e31a59f3a549e1ee8b619889a9225a530c2",
       "importedPath": "upstream/openai-symphony/elixir/mix.exs",
       "license": "Apache-2.0",
       "modificationNoticePresent": true,
@@ -859,8 +859,8 @@
       "upstreamRepository": "https://github.com/openai/symphony.git"
     },
     {
-      "importedContentSha256": "20dc58185aed80e6ddb92c992c01ebe364477dd6db249d2295adc41e0be384ef",
-      "importedGitBlobSha": "07d100648f6f855bf189181b8559b385a73c75b8",
+      "importedContentSha256": "6b47382c67b5b14461fb1d83176faab11c0dddb5785414392792cec9f550f140",
+      "importedGitBlobSha": "a309e6a913bdf73e2a3180241e5dce3947850679",
       "importedPath": "upstream/openai-symphony/elixir/mix.lock",
       "license": "Apache-2.0",
       "modificationNoticePresent": true,
