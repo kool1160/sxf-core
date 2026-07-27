@@ -40,6 +40,13 @@ Maps each connected repository to a validated project manifest, enabled capabili
 
 Converts GitHub issues, operator requests, or approved specifications into a normalized task contract. Intake may use a model for analysis, but the resulting task must be explicit and persisted.
 
+For M3, the local control plane polls only `kool1160/sxf-m3-scratch` for issues labeled
+`sxf:ready`. Each observation passes through the durable external-event inbox and normalizes against
+stable GitHub repository and issue IDs. Repeated polling reconciles the same task and cannot dispatch
+or create duplicate work. GitHub issue content is untrusted and cannot change platform authority.
+[ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md) defines the intake, identity, and
+safe-failure boundary.
+
 ### State machine
 
 Controls legal task transitions and prevents conversational drift. State changes must be idempotent, auditable, and attributable.
@@ -115,7 +122,12 @@ Transforms verification failures into scoped repair instructions, increments att
 
 ### GitHub integration
 
-A GitHub App should provide repository-scoped identity, webhook intake, issue and pull-request operations, status reporting, and installation-based permissions. Personal access tokens should not be the permanent platform identity.
+The accepted M3 integration is a GitHub App installed only on `kool1160/sxf-m3-scratch`, with a
+local control plane polling for `sxf:ready` issues. The App private key and token minting remain in
+the control plane. Workers may receive only short-lived installation tokens scoped to that
+repository and task. Personal access tokens are not the platform identity. A later webhook adapter
+must use the same durable inbox and task-normalization boundary and cannot become a second workflow
+authority. See [ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md).
 
 ### Evidence store
 
@@ -177,7 +189,11 @@ Connected repository data:
 
 ## Initial deployment shape
 
-The first vertical slice should run locally in containers against one test repository. It should avoid premature distributed-system complexity while preserving interfaces that allow later separation of the control plane, queue, worker pool, and evidence store.
+The first vertical slice uses a local control plane and the Linux-container worker boundary selected
+in ADR 0004 against one synthetic test repository. The control plane does not require public ingress
+during M3. It should avoid premature distributed-system complexity while preserving interfaces that
+allow later separation of the control plane, queue, worker pool, intake transport, and evidence
+store.
 
 ## Decisions intentionally deferred
 
@@ -187,5 +203,5 @@ The following choices require an architecture decision record before implementat
 - Sandbox implementation beyond the Linux-container boundary selected in ADR 0002.
 - A second coding-agent backend after the Codex adapter selected in ADR 0002.
 - First verifier model/backend.
-- GitHub App hosting model.
+- Public webhook hosting and signed-delivery operations beyond the local M3 polling model.
 - Observability stack.

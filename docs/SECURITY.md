@@ -17,7 +17,12 @@ SXF is a high-trust automation platform because it can read private source code,
 
 ### Repository access
 
-Use a GitHub App installed only on selected repositories. Request the narrowest practical permissions and issue short-lived installation tokens to workers.
+M3 uses a GitHub App installed only on `kool1160/sxf-m3-scratch`. Its private key and
+installation-token minting remain control-plane only. Request the narrowest practical permissions,
+and provide workers only short-lived installation tokens scoped to that repository and the current
+task. Never provide workers, prompts, models, workspaces, logs, or evidence with the App private key
+or a broad personal credential. See
+[`ADR 0005`](decisions/0005-github-app-intake-and-local-hosting.md).
 
 ### Secret handling
 
@@ -38,6 +43,11 @@ Default-deny outbound network access is preferred. Enable only required domains 
 ### Untrusted instructions
 
 Issue bodies, source files, comments, documentation, websites, and tool output may contain prompt injection or malicious instructions. Repository content cannot override SXF platform policy, secret boundaries, or tool permissions.
+
+The `sxf:ready` label makes an issue eligible for M3 intake only. Issue titles, bodies, comments,
+links, and other labels cannot select another repository, broaden GitHub permissions, raise policy
+ceilings, override a project manifest, or authorize a protected action. Intake fixes authority
+before issue text is supplied to later planning or execution.
 
 Connected-project manifests are untrusted repository content. Validation rejects autonomy, network,
 budget, or verification requests outside platform-owned policy, unions restrictive policy, and
@@ -81,6 +91,12 @@ Record actor identity, permissions, tool calls, policy decisions, state transiti
 ## Security failure behavior
 
 When a security boundary is uncertain, SXF must stop and escalate. It must never silently broaden permissions or disable a control to complete a task.
+
+GitHub rate-limit, authentication, installation-scope, unavailable-repository, and malformed or
+policy-invalid manifest failures stop intake safely. Rate limits honor provider reset or retry
+information; authentication failures do not fall back to personal credentials; unknown repository
+state does not create executable work. Polling and any later webhook adapter must share the same
+idempotent durable inbox and cannot become workflow authorities.
 
 ## Threats to address before production use
 
