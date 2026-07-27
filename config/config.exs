@@ -12,6 +12,10 @@ config :sxf_core, Sxf.Repo,
   busy_timeout: 5_000,
   pool_size: 5
 
+# The durable coordinator is wired for explicit startup, but remains disabled until a caller
+# supplies approved backend modules. Imported Symphony is never supervised as a workflow owner.
+config :sxf_core, execution_coordinator_enabled: false
+
 # Imported Symphony is compile-time foundation code only. These defense-in-depth switches remain
 # false until a later SXF integration supplies durable authorization and a Linux-container worker.
 config :symphony_elixir,

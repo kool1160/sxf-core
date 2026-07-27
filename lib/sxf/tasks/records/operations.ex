@@ -261,6 +261,7 @@ defmodule Sxf.Tasks.WorkerLease do
     field :expires_at, :utc_datetime_usec
     field :released_at, :utc_datetime_usec
     field :idempotency_key, :string
+    field :request_fingerprint, :string
     field :metadata, :map, default: %{}
     belongs_to :task, Sxf.Tasks.Task
     belongs_to :attempt, Sxf.Tasks.TaskAttempt
@@ -281,6 +282,7 @@ defmodule Sxf.Tasks.WorkerLease do
       :expires_at,
       :released_at,
       :idempotency_key,
+      :request_fingerprint,
       :metadata
     ])
     |> validate_required([
@@ -296,6 +298,7 @@ defmodule Sxf.Tasks.WorkerLease do
     ])
     |> validate_number(:fencing_token, greater_than: 0)
     |> validate_inclusion(:status, @statuses)
+    |> validate_format(:request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> validate_expiry_order()
     |> foreign_key_constraint(:task_id)
     |> foreign_key_constraint(:attempt_id)
