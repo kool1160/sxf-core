@@ -138,6 +138,14 @@ defmodule Sxf.ExecutionFakes.Agent do
   def cancel(context) do
     if pid = context.options[:notify], do: send(pid, {:agent_cancelled, context.claim.attempt.id})
 
+    if context.options[:cancel_barrier] do
+      if pid = context.options[:notify], do: send(pid, {:agent_cancel_waiting, self()})
+
+      receive do
+        :continue_cancel -> :ok
+      end
+    end
+
     case context.options[:cancel] do
       :error -> {:error, :cancel_failed}
       _ -> :ok

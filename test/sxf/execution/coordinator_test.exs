@@ -277,6 +277,110 @@ defmodule Sxf.Execution.CoordinatorTest do
              )
   end
 
+  test "a synchronous backend event at the runtime deadline stops without deadlock or duplicate authority" do
+    fixture = ready_fixture()
+    budget = budget_fixture(fixture.task, %{max_runtime_ms: 50})
+    {clock, now_fn} = mutable_clock(@execution_time)
+    correlation_id = uuid()
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture,
+        scenario: :controllable,
+        notify: self(),
+        now_fn: now_fn,
+        cancel_barrier: true
+      )
+
+    assert {:ok, %{status: :accepted, claim: claim}} =
+             Coordinator.tick(coordinator,
+               idempotency_key: "dispatch:backend-event-deadline",
+               correlation_id: correlation_id
+             )
+
+    assert_receive {:agent_started, worker}
+    worker_monitor = Process.monitor(worker)
+    Elixir.Agent.update(clock, fn _ -> claim.runtime_deadline_at end)
+    event = usage_event(1, %{runtime_ms: 1}, claim.runtime_deadline_at)
+    send(worker, {:emit, event})
+
+    assert_receive {:DOWN, ^worker_monitor, :process, ^worker, :shutdown}
+    assert_receive {:agent_cancelled, attempt_id}
+    assert attempt_id == claim.attempt.id
+    assert_receive {:agent_cancel_waiting, cancel_worker}
+
+    assert Coordinator.active_count(coordinator) == 1
+
+    send(coordinator, {
+      :execution_finished,
+      claim.lease.id,
+      worker,
+      {:ok, %Sxf.Execution.Result{outcome: :success, reason: "queued late completion"}},
+      []
+    })
+
+    send(cancel_worker, :continue_cancel)
+
+    assert {:ok, [%{outcome: :runtime_timeout, cancellation: %{attempted: true, result: :ok}}]} =
+             Coordinator.await_idle(coordinator)
+
+    assert_receive :sandbox_release
+    assert_receive :workspace_release
+    refute_received {:agent_cancelled, ^attempt_id}
+    refute_received :sandbox_release
+    refute_received :workspace_release
+    refute_received {:event_emitted, _}
+
+    assert Repo.get!(Budget, budget.id).status == "exhausted"
+    assert Repo.get!(DomainTask, fixture.task.id).state == "BLOCKED"
+    assert Repo.get!(TaskAttempt, claim.attempt.id).status == "failed"
+    assert Repo.get!(TaskAttempt, claim.attempt.id).outcome == "timeout"
+    assert Repo.get!(WorkerLease, claim.lease.id).status == "released"
+    assert runtime_total(fixture.task.id) == 50
+
+    assert Repo.aggregate(
+             from(event in ExecutionEvent,
+               where: event.task_id == ^fixture.task.id and event.kind == "timed_out"
+             ),
+             :count
+           ) == 1
+
+    assert Repo.aggregate(
+             from(event in ExecutionEvent,
+               where: event.task_id == ^fixture.task.id and event.kind == "completed"
+             ),
+             :count
+           ) == 0
+
+    assert {:error, :stale_backend_event} =
+             TaskStore.record_event(
+               claim,
+               event,
+               event_attrs(fixture, claim.runtime_deadline_at)
+             )
+
+    replay_attrs = %{
+      actor_id: fixture.system_actor.id,
+      observed_at: claim.runtime_deadline_at,
+      correlation_id: correlation_id,
+      idempotency_key: "dispatch:backend-event-deadline:runtime_timeout",
+      reason: "backend event observed after the durable runtime deadline",
+      cancellation: %{attempted: true, result: :ok},
+      cleanup_errors: []
+    }
+
+    assert {:ok, %{idempotent?: true}} =
+             TaskStore.enforce_runtime_timeout(claim, replay_attrs)
+
+    assert runtime_total(fixture.task.id) == 50
+
+    assert Repo.aggregate(
+             from(event in ExecutionEvent,
+               where: event.task_id == ^fixture.task.id and event.kind == "timed_out"
+             ),
+             :count
+           ) == 1
+  end
+
   test "positive durable runtime usage refreshes the deadline and stops a later hang at remaining time" do
     fixture = ready_fixture()
     budget_fixture(fixture.task, %{max_runtime_ms: 100_000})

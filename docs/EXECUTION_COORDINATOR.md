@@ -23,7 +23,10 @@ contract. Control-plane-generated observation times, expiries, and correlation I
 otherwise identical replay conflict. An exact replay reconstructs the original durable claim and
 does not invoke workspace, sandbox, or agent boundaries again, whether the original execution is
 active or complete. Changed semantic input conflicts. Terminal tasks and tasks outside the eligible
-states are never selected.
+states are never selected. If an independent SQLite connection loses immediate-transaction lock
+contention while claiming, `TaskStore` returns the same safe no-work result as an empty selection.
+The winning transaction remains the only source of an attempt, lease, transition, attempt sequence,
+and fencing token.
 
 ## Supervision and control ticks
 

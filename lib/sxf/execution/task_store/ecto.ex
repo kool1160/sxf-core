@@ -46,13 +46,18 @@ defmodule Sxf.Execution.TaskStore.Ecto do
           dispatch_input: Map.get(attrs, :dispatch_input, %{})
         })
 
-      Repo.transaction(fn ->
-        case existing_claim(attrs.idempotency_key) do
-          nil -> create_claim(attrs, request_fingerprint)
-          lease -> replay_claim(lease, request_fingerprint)
-        end
-      end)
-      |> flatten()
+      try do
+        Repo.transaction(fn ->
+          case existing_claim(attrs.idempotency_key) do
+            nil -> create_claim(attrs, request_fingerprint)
+            lease -> replay_claim(lease, request_fingerprint)
+          end
+        end)
+        |> flatten()
+      rescue
+        error in Exqlite.Error ->
+          if sqlite_lock_contention?(error), do: {:ok, nil}, else: reraise(error, __STACKTRACE__)
+      end
     end
   end
 
@@ -1080,4 +1085,8 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
   defp flatten({:ok, result}), do: {:ok, result}
   defp flatten({:error, reason}), do: {:error, reason}
+
+  defp sqlite_lock_contention?(%Exqlite.Error{message: message}) when is_binary(message) do
+    message in ["database is locked", "database table is locked"]
+  end
 end
