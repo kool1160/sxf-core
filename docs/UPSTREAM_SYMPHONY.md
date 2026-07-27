@@ -57,6 +57,10 @@ Only dependency constraints and resolved pins needed for integrated compilation 
 `mix hex.audit` are changed. The import manifest records both files as modified; the pull request
 must describe exact version changes and conformance evidence.
 
+The current security patch constrains Bandit to exactly `1.12.1`, the first release containing the
+fix for CVE-2026-65623, and resolves that same version in both the vendored and root lockfiles. It
+does not change the pinned Symphony commit or any unrelated dependency version.
+
 ## Upgrade procedure
 
 1. Open a dedicated upgrade issue and pin the proposed upstream commit.
