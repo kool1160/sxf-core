@@ -2,8 +2,9 @@
 
 This document is the normative loading and validation contract for the `0.1` connected-project
 manifest defined by [`schemas/project.schema.json`](../schemas/project.schema.json). It implements
-GitHub Issue #3 within M2. It does not onboard a repository, execute a command, create a workspace,
-or persist project state.
+GitHub Issue #3 within M2. The validator itself does not onboard a repository, execute a command,
+create a workspace, or persist project state. The separate M3 registry boundary described below
+persists only a successful normalized result.
 
 ## File contract
 
@@ -129,6 +130,38 @@ policy =
 Sxf.ProjectManifest.load("project.sxf.yaml", platform_policy: policy)
 ```
 
+## Durable registration boundary
+
+`Sxf.ProjectRegistry.register_repository/1` accepts manifest bytes and format together with
+provider-neutral repository metadata, a platform-owned `Policy`, and actor/time/correlation
+attribution. It calls `Sxf.ProjectManifest.load_string/3` before writing. A validation or policy
+error therefore creates no `Project` or `RepositoryRegistration`.
+
+One successful command atomically creates exactly one project and repository registration. The
+durable repository identity is `(provider, external_id)`, where `external_id` is the provider's
+stable repository identifier rather than owner/name display text. The registration stores:
+
+- the `0.1` schema version;
+- the complete normalized and policy-bounded manifest snapshot;
+- SHA-256 of the exact raw manifest bytes;
+- a semantic registration fingerprint; and
+- the registering actor, accepted timestamp, and correlation ID.
+
+The semantic fingerprint covers stable repository metadata, actor identity, and the normalized
+manifest. Raw bytes, YAML-versus-JSON format, receive timestamp, and correlation envelope are not
+semantic. Consequently, equivalent YAML and JSON replay the original registration, while changed
+normalized content, owner/name, clone URL, default branch, or actor conflicts explicitly. Replay
+does not replace the original raw hash or attribution.
+
+Registration and lookup execute no manifest command, perform no network access, and create no task,
+transition, inbox, outbox, attempt, lease, retry, blocker, budget, or usage record. Immediate SQLite
+transactions and the unique provider/external-ID index prevent concurrent duplicate projects.
+Lookup returns the persisted normalized snapshot after process or Repo restart.
+
+Repository metadata updates, manifest-version replacement, owner/name reconciliation after rename
+or transfer, and retirement/re-registration rules are deliberately deferred. A changed command may
+not silently update an accepted registration.
+
 ## Safety boundary
 
 Validation performs only bounded file metadata/read operations, isolated parsing, decoded-structure
@@ -144,13 +177,13 @@ checks, schema validation, policy validation, and pure normalization. It never:
 Tests place a file-writing command in a valid manifest, validate it, and prove that the command was
 returned unchanged but never executed and that the directory contents remained unchanged.
 
-## M2 scope and evidence
+## M2 validation and M3 registration evidence
 
 This work was required by the M2 completion gate. Completion evidence is the checked-in
 example test, YAML/JSON equivalence, strict schema failures, budget/verification/authority policy
 regressions, decoded-structure and YAML-reference limits, non-execution and non-mutation regression,
 dependency audit, compilation without warnings, and full test suite.
 
-Live onboarding, repository registration persistence, GitHub integration, command execution,
-workspace creation, sandbox enforcement, and scheduler integration remain assigned to later
-milestones and are explicitly out of scope.
+M3 adds only caller-supplied durable registration and lookup around that pure result. Live manifest
+discovery, repository updates, GitHub authentication/API integration, command execution, workspace
+creation, sandbox enforcement, and scheduler integration remain explicitly out of scope.

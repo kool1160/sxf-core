@@ -24,6 +24,14 @@ exact replay returns the original durable result; reusing an identity with diffe
 explicit conflict. Later source versions create new inbox facts while reconciling the same
 repository-scoped task. See [`TASK_DOMAIN.md`](TASK_DOMAIN.md).
 
+Connected-project registration uses `(provider, stable external repository ID)` as its natural
+identity. Its semantic fingerprint includes repository metadata, registering actor, and the
+normalized policy-bounded manifest, but excludes raw representation, timestamp, and correlation
+envelopes. Equivalent YAML and JSON therefore replay one registration; changed normalized authority
+or metadata conflicts. Project and repository rows commit together in one immediate SQLite
+transaction, so validation, actor, constraint, database, and concurrent-writer failures cannot
+leave an orphan project. Lookup and replay depend only on durable SQLite state after restart.
+
 ## Failure classes
 
 ### Transient infrastructure failure
