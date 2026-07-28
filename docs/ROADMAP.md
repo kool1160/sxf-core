@@ -14,7 +14,9 @@ The roadmap is organized around working vertical slices. SXF should prove one re
   single-repository execution vertical slice,” remains active. Child
   [Issue #23](https://github.com/kool1160/sxf-core/issues/23) and
   [ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md) record the accepted local GitHub
-  App polling and intake boundary.
+  App polling and intake boundary. Child
+  [Issue #27](https://github.com/kool1160/sxf-core/issues/27) adds the bounded durable
+  connected-project registration and lookup prerequisite without implementing live GitHub access.
 
 ## Phase 0 — Foundation
 
@@ -29,6 +31,7 @@ Goal: take one well-specified GitHub issue in a test repository from `READY` to 
 
 - Local control-plane service.
 - Durable task and attempt state.
+- Atomic registration of one caller-supplied, validated, policy-bounded connected-project manifest.
 - Idempotent local GitHub App polling for `sxf:ready` issues through the durable inbox, as selected
   by [ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md).
 - One isolated workspace at a time.
@@ -58,6 +61,9 @@ Goal: operate several repositories without context or credential leakage.
 - Repository concurrency controls.
 - Scheduler and dependency handling.
 - Cross-project isolation tests.
+
+The bounded M3 registration prerequisite does not complete this phase's multi-repository registry,
+installation management, update/rename reconciliation, or per-project secret operations.
 
 ## Phase 4 — Provider and capability portability
 

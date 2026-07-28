@@ -28,8 +28,15 @@ defmodule Sxf.Tasks.RepositoryRegistration do
     field :name, :string
     field :clone_url, :string
     field :default_branch, :string, default: "main"
+    field :manifest_schema_version, :string
+    field :normalized_manifest, :map
+    field :raw_manifest_sha256, :string
+    field :registration_fingerprint, :string
+    field :registered_at, :utc_datetime_usec
+    field :registration_correlation_id, Ecto.UUID
     field :metadata, :map, default: %{}
     belongs_to :project, Sxf.Tasks.Project
+    belongs_to :registered_by_actor, Sxf.Tasks.Actor
     timestamps()
   end
 
@@ -44,11 +51,41 @@ defmodule Sxf.Tasks.RepositoryRegistration do
       :name,
       :clone_url,
       :default_branch,
+      :manifest_schema_version,
+      :normalized_manifest,
+      :raw_manifest_sha256,
+      :registration_fingerprint,
+      :registered_by_actor_id,
+      :registered_at,
+      :registration_correlation_id,
       :metadata
     ])
     |> validate_required([:project_id, :provider, :external_id, :owner, :name, :clone_url])
+    |> validate_length(:provider, min: 1, max: 100)
+    |> validate_length(:external_id, min: 1, max: 255)
+    |> validate_length(:owner, min: 1, max: 255)
+    |> validate_length(:name, min: 1, max: 255)
+    |> validate_length(:clone_url, min: 1, max: 2048)
+    |> validate_length(:default_branch, min: 1, max: 255)
+    |> validate_format(:raw_manifest_sha256, ~r/\A[0-9a-f]{64}\z/)
+    |> validate_format(:registration_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:project_id)
+    |> foreign_key_constraint(:registered_by_actor_id)
     |> unique_constraint([:provider, :external_id])
+  end
+
+  def registration_changeset(registration, attrs) do
+    registration
+    |> changeset(attrs)
+    |> validate_required([
+      :manifest_schema_version,
+      :normalized_manifest,
+      :raw_manifest_sha256,
+      :registration_fingerprint,
+      :registered_by_actor_id,
+      :registered_at,
+      :registration_correlation_id
+    ])
   end
 end
 

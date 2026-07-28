@@ -36,6 +36,20 @@ The authoritative coordinator. It persists project registrations, task state, at
 
 Maps each connected repository to a validated project manifest, enabled capabilities, trust level, autonomy policy, secret scope, and execution environment.
 
+The M3 registry boundary is `Sxf.ProjectRegistry`. A caller supplies repository metadata, manifest
+bytes, format, and a platform-owned policy; the registry validates through `Sxf.ProjectManifest`
+before opening its write transaction. It then creates one `Project` and one
+`RepositoryRegistration` atomically under the provider-stable `(provider, external_id)` identity.
+The registration stores the policy-bounded normalized manifest, source schema version, raw content
+hash, semantic fingerprint, and actor/time/correlation attribution. It never discovers a manifest
+over the network or executes a declared command.
+
+Equivalent representations with the same normalized manifest and repository metadata replay the
+original registration. Changed normalized content or metadata conflicts rather than mutating the
+accepted authority boundary. Independent SQLite writers serialize through immediate transactions,
+and lookup after restart reads only durable records. Repository rename/transfer reconciliation,
+manifest updates, installation management, and broader multi-project operation remain deferred.
+
 ### Intake adapter
 
 Converts GitHub issues, operator requests, or approved specifications into a normalized task contract. Intake may use a model for analysis, but the resulting task must be explicit and persisted.
