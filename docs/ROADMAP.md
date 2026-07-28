@@ -16,7 +16,9 @@ The roadmap is organized around working vertical slices. SXF should prove one re
   [ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md) record the accepted local GitHub
   App polling and intake boundary. Child
   [Issue #27](https://github.com/kool1160/sxf-core/issues/27) adds the bounded durable
-  connected-project registration and lookup prerequisite without implementing live GitHub access.
+  connected-project registration and lookup prerequisite. Child
+  [Issue #29](https://github.com/kool1160/sxf-core/issues/29) adds the bounded one-shot GitHub App
+  authentication and issue-polling adapter without recurring operation or repository mutation.
 
 ## Phase 0 — Foundation
 

@@ -65,9 +65,13 @@ JSON connected-project manifests without executing their commands. A provider-ne
 registry now atomically persists one policy-bounded normalized manifest and repository identity
 with semantic replay, contention protection, and restart-durable lookup. A durable intake command
 atomically records external issue observations and normalizes one repository-scoped `DISCOVERED`
-task with replay and concurrency protection. It does not yet contain the GitHub App authentication
-or polling adapter, live agent, repository or container execution, container workspace runtime, or
-evidence byte store. The pinned Symphony Elixir foundation is retained under
+task with replay and concurrency protection. A one-shot local-control-plane GitHub App adapter now
+signs bounded RS256 App JWTs, mints a token scoped to the registered M3 repository, reads the
+complete bounded `sxf:ready` issue view through an injectable transport, and submits canonical
+observations to that durable command without scheduling or repository mutation. It does not yet
+contain live operator credentials/setup, a recurring poll loop, live agent, repository or container
+execution, container workspace runtime, or evidence byte store. The pinned Symphony Elixir
+foundation is retained under
 `upstream/openai-symphony` as a compile-time, default-denied path dependency; it is not started and
 does not replace SXF's durable task authority.
 
@@ -75,8 +79,9 @@ See [`AGENTS.md`](AGENTS.md) for repository guidance, [`docs/TASK_DOMAIN.md`](do
 for the durable lifecycle contract, [`docs/PROJECT_MANIFEST.md`](docs/PROJECT_MANIFEST.md) for the
 manifest validation contract, [`docs/UPSTREAM_SYMPHONY.md`](docs/UPSTREAM_SYMPHONY.md) for the
 upstream boundary, [`docs/EXECUTION_COORDINATOR.md`](docs/EXECUTION_COORDINATOR.md) for the M3
-coordinator contract, and [`docs/`](docs/) for broader product, architecture, reliability, security,
-and roadmap documents.
+coordinator contract, [`docs/GITHUB_ISSUE_INTAKE.md`](docs/GITHUB_ISSUE_INTAKE.md) for the bounded
+M3 App and polling boundary, and [`docs/`](docs/) for broader product, architecture, reliability,
+security, and roadmap documents.
 
 ## Durable-core checks
 

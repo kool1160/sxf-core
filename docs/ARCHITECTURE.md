@@ -59,9 +59,14 @@ For M3, the local control plane polls only `kool1160/sxf-m3-scratch` for issues 
 stable GitHub repository and issue IDs. Repeated polling reconciles the same task and cannot dispatch
 or create duplicate work. GitHub issue content is untrusted and cannot change platform authority.
 [ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md) defines the intake, identity, and
-safe-failure boundary. The provider-neutral atomic inbox-to-`DISCOVERED` task command is implemented;
-GitHub authentication, API transport, polling cadence, label evaluation, and manifest-gated
-promotion remain separate later M3 adapters.
+safe-failure boundary. `Sxf.GitHub.IssuePoller.poll_once/1` now supplies the bounded provider
+adapter: it resolves the durable registration, mints one repository-scoped installation token,
+fetches the complete bounded open-issue view for the exact `sxf:ready` label, excludes pull
+requests, constructs canonical observations, and calls the provider-neutral atomic
+inbox-to-`DISCOVERED` task command. Authentication, transport, clock, private-key resolution, and
+correlation generation are replaceable boundaries. The poller does not schedule itself, dispatch
+work, execute manifest commands, or mutate GitHub. Manifest discovery and manifest-gated task
+promotion remain later M3 work.
 
 ### State machine
 
@@ -143,7 +148,10 @@ local control plane polling for `sxf:ready` issues. The App private key and toke
 the control plane. Workers may receive only short-lived installation tokens scoped to that
 repository and task. Personal access tokens are not the platform identity. A later webhook adapter
 must use the same durable inbox and task-normalization boundary and cannot become a second workflow
-authority. See [ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md).
+authority. The implemented one-shot adapter is documented in
+[`GITHUB_ISSUE_INTAKE.md`](GITHUB_ISSUE_INTAKE.md); recurring polling, live App installation, and
+worker credentials remain external or deferred. See
+[ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md).
 
 ### Evidence store
 

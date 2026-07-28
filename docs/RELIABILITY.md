@@ -24,6 +24,14 @@ exact replay returns the original durable result; reusing an identity with diffe
 explicit conflict. Later source versions create new inbox facts while reconciling the same
 repository-scoped task. See [`TASK_DOMAIN.md`](TASK_DOMAIN.md).
 
+The GitHub one-shot poller orders observations by `updated_at` and a stable issue-ID tiebreaker,
+then hashes a canonical semantic observation rather than raw HTTP bytes. JSON property order,
+whitespace, pagination envelopes, provider request IDs, receive times, and label ordering do not
+change that hash. It fetches every bounded page before normalization, so authentication,
+rate-limit, malformed repository, later-page, or pagination-limit failure creates no partial task
+set. Exact repeated polls replay the durable result; a later source version reuses the task; the
+same version with changed canonical content remains an explicit conflict.
+
 Connected-project registration uses `(provider, stable external repository ID)` as its natural
 identity. Its semantic fingerprint includes repository metadata, registering actor, and the
 normalized policy-bounded manifest, but excludes raw representation, timestamp, and correlation
