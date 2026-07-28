@@ -123,6 +123,9 @@ defmodule Sxf.Tasks.Task do
     |> validate_inclusion(:state, Sxf.Tasks.StateMachine.states())
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:repository_registration_id)
+    |> unique_constraint(:source_ref,
+      name: :tasks_repository_registration_id_source_ref_index
+    )
   end
 
   def transition_changeset(task, attrs) do

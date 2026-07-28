@@ -16,7 +16,10 @@ defmodule Sxf.Tasks do
   alias Sxf.Tasks.EventEvidenceReference
   alias Sxf.Tasks.EvidenceReference
   alias Sxf.Tasks.ExternalActionOutboxReference
+  alias Sxf.Tasks.ExternalEventInboxReference
   alias Sxf.Tasks.HumanDecision
+  alias Sxf.Tasks.Project
+  alias Sxf.Tasks.RepositoryRegistration
   alias Sxf.Tasks.RetrySchedule
   alias Sxf.Tasks.StateMachine
   alias Sxf.Tasks.Task
@@ -24,6 +27,13 @@ defmodule Sxf.Tasks do
   alias Sxf.Tasks.TransitionEvent
   alias Sxf.Tasks.UsageEntry
   alias Sxf.Tasks.WorkerLease
+
+  @max_issue_title_bytes 500
+  @max_issue_body_bytes 65_536
+  @max_intake_metadata_bytes 32_768
+  @max_intake_metadata_depth 8
+  @max_intake_metadata_nodes 512
+  @max_intake_metadata_string_bytes 16_384
 
   @type command_result ::
           {:ok, %{task: %Task{}, event: %TransitionEvent{}, idempotent?: boolean()}}
@@ -45,6 +55,39 @@ defmodule Sxf.Tasks do
           nil -> create_new_task(attrs, fingerprint)
           task -> replay_creation(task, attrs.idempotency_key, fingerprint)
         end
+      end)
+      |> flatten_transaction()
+    end
+  end
+
+  @doc """
+  Atomically persists one external issue observation and creates or reconciles its durable task.
+
+  The provider, repository external ID, issue external ID, and source version derive the inbox
+  observation identity. Fresh control-plane receipt times and correlations are observation
+  envelope values rather than replay semantics.
+  """
+  def normalize_external_issue(attrs) do
+    required = [
+      :provider,
+      :repository_external_id,
+      :issue_external_id,
+      :source_version,
+      :payload_sha256,
+      :title,
+      :body,
+      :actor_id,
+      :received_at,
+      :correlation_id
+    ]
+
+    with :ok <- require_keys(attrs, required),
+         :ok <- validate_intake_command(attrs) do
+      request_fingerprint = intake_fingerprint(attrs)
+      external_id = intake_observation_id(attrs)
+
+      Repo.transaction(fn ->
+        do_normalize_external_issue(attrs, external_id, request_fingerprint)
       end)
       |> flatten_transaction()
     end
@@ -402,6 +445,178 @@ defmodule Sxf.Tasks do
       |> unwrap_or_rollback()
 
     %{task: task, event: event, idempotent?: false}
+  end
+
+  defp do_normalize_external_issue(attrs, external_id, request_fingerprint) do
+    case Repo.get_by(ExternalEventInboxReference,
+           source: attrs.provider,
+           external_id: external_id
+         ) do
+      %ExternalEventInboxReference{request_fingerprint: ^request_fingerprint} = inbox ->
+        replay_external_issue(inbox)
+
+      %ExternalEventInboxReference{} ->
+        Repo.rollback(:idempotency_conflict)
+
+      nil ->
+        normalize_new_external_issue(attrs, external_id, request_fingerprint)
+    end
+  end
+
+  defp normalize_new_external_issue(attrs, external_id, request_fingerprint) do
+    actor = Repo.get(Actor, attrs.actor_id) || Repo.rollback(:actor_not_found)
+
+    unless actor.kind in ["system", "external_system"] do
+      Repo.rollback(:intake_actor_required)
+    end
+
+    registration =
+      Repo.get_by(RepositoryRegistration,
+        provider: attrs.provider,
+        external_id: attrs.repository_external_id
+      ) || Repo.rollback(:repository_registration_not_found)
+
+    project = Repo.get(Project, registration.project_id) || Repo.rollback(:project_not_found)
+
+    if project.status != "active" do
+      Repo.rollback(:project_not_active)
+    end
+
+    inbox =
+      %ExternalEventInboxReference{}
+      |> ExternalEventInboxReference.changeset(%{
+        source: attrs.provider,
+        external_id: external_id,
+        source_version: attrs.source_version,
+        payload_sha256: attrs.payload_sha256,
+        request_fingerprint: request_fingerprint,
+        status: "received",
+        received_at: attrs.received_at,
+        correlation_id: attrs.correlation_id,
+        metadata: intake_inbox_metadata(attrs)
+      })
+      |> Repo.insert()
+      |> unwrap_or_rollback()
+
+    {task, event, task_created?} =
+      case Repo.get_by(Task,
+             repository_registration_id: registration.id,
+             source_ref: attrs.issue_external_id
+           ) do
+        nil ->
+          create_task_from_external_issue(attrs, registration)
+
+        task ->
+          {task, creation_event!(task.id), false}
+      end
+
+    inbox =
+      inbox
+      |> ExternalEventInboxReference.changeset(%{
+        task_id: task.id,
+        source: inbox.source,
+        external_id: inbox.external_id,
+        source_version: inbox.source_version,
+        payload_sha256: inbox.payload_sha256,
+        request_fingerprint: inbox.request_fingerprint,
+        status: "processed",
+        received_at: inbox.received_at,
+        processed_at: attrs.received_at,
+        correlation_id: inbox.correlation_id,
+        metadata: Map.put(inbox.metadata, "task_created", task_created?)
+      })
+      |> Repo.update()
+      |> unwrap_or_rollback()
+
+    %{
+      inbox: inbox,
+      task: task,
+      event: event,
+      task_created?: task_created?,
+      idempotent?: false
+    }
+  end
+
+  defp replay_external_issue(
+         %ExternalEventInboxReference{status: "processed", task_id: task_id} = inbox
+       )
+       when not is_nil(task_id) do
+    task = Repo.get(Task, task_id) || Repo.rollback(:task_not_found)
+
+    %{
+      inbox: inbox,
+      task: task,
+      event: creation_event!(task.id),
+      task_created?: Map.get(inbox.metadata, "task_created", false),
+      idempotent?: true
+    }
+  end
+
+  defp replay_external_issue(_inbox), do: Repo.rollback(:inbox_incomplete)
+
+  defp create_task_from_external_issue(attrs, registration) do
+    source_identity = intake_source_identity(attrs)
+
+    task_attrs = %{
+      id: Sxf.Identifiers.generate(),
+      project_id: registration.project_id,
+      repository_registration_id: registration.id,
+      title: attrs.title,
+      source_ref: attrs.issue_external_id,
+      actor_id: attrs.actor_id,
+      reason: "external issue normalized",
+      reason_code: "external_issue_intake",
+      occurred_at: attrs.received_at,
+      correlation_id: attrs.correlation_id,
+      idempotency_key: "intake:create:#{fingerprint(source_identity)}",
+      metadata: intake_task_metadata(attrs)
+    }
+
+    %{task: task, event: event} = create_new_task(task_attrs, creation_fingerprint(task_attrs))
+    {task, event, true}
+  end
+
+  defp creation_event!(task_id) do
+    Repo.get_by(TransitionEvent, task_id: task_id, sequence: 1) ||
+      Repo.rollback(:task_creation_event_not_found)
+  end
+
+  defp intake_source_identity(attrs) do
+    %{
+      provider: attrs.provider,
+      repository_external_id: attrs.repository_external_id,
+      issue_external_id: attrs.issue_external_id
+    }
+  end
+
+  defp intake_observation_id(attrs) do
+    identity =
+      attrs
+      |> intake_source_identity()
+      |> Map.put(:source_version, attrs.source_version)
+
+    "issue-observation:#{fingerprint(identity)}"
+  end
+
+  defp intake_task_metadata(attrs) do
+    %{
+      "external_issue" => %{
+        "provider" => attrs.provider,
+        "repository_external_id" => attrs.repository_external_id,
+        "issue_external_id" => attrs.issue_external_id,
+        "source_version" => attrs.source_version,
+        "body" => attrs.body,
+        "attributes" => Map.get(attrs, :metadata, %{})
+      }
+    }
+  end
+
+  defp intake_inbox_metadata(attrs) do
+    %{
+      "repository_external_id" => attrs.repository_external_id,
+      "issue_external_id" => attrs.issue_external_id,
+      "source_version" => attrs.source_version
+    }
   end
 
   defp replay_creation(task, idempotency_key, fingerprint) do
@@ -1193,6 +1408,21 @@ defmodule Sxf.Tasks do
     })
   end
 
+  defp intake_fingerprint(attrs) do
+    fingerprint(%{
+      command: :normalize_external_issue,
+      provider: attrs.provider,
+      repository_external_id: attrs.repository_external_id,
+      issue_external_id: attrs.issue_external_id,
+      source_version: attrs.source_version,
+      payload_sha256: attrs.payload_sha256,
+      title: attrs.title,
+      body: attrs.body,
+      actor_id: attrs.actor_id,
+      metadata: Map.get(attrs, :metadata, %{})
+    })
+  end
+
   defp transition_fingerprint(attrs) do
     fingerprint(%{
       command: :transition_task,
@@ -1338,6 +1568,111 @@ defmodule Sxf.Tasks do
         :ok
     end
   end
+
+  defp validate_intake_command(attrs) do
+    metadata = Map.get(attrs, :metadata, %{})
+
+    cond do
+      not valid_intake_string?(attrs.provider, 100) ->
+        {:error, {:invalid_command_field, :provider}}
+
+      not valid_intake_string?(attrs.repository_external_id, 255) ->
+        {:error, {:invalid_command_field, :repository_external_id}}
+
+      not valid_intake_string?(attrs.issue_external_id, 255) ->
+        {:error, {:invalid_command_field, :issue_external_id}}
+
+      not valid_intake_string?(attrs.source_version, 255) ->
+        {:error, {:invalid_command_field, :source_version}}
+
+      not valid_sha256?(attrs.payload_sha256) ->
+        {:error, {:invalid_command_field, :payload_sha256}}
+
+      not valid_intake_string?(attrs.title, @max_issue_title_bytes) ->
+        {:error, {:invalid_command_field, :title}}
+
+      not is_binary(attrs.body) or not String.valid?(attrs.body) or
+          byte_size(attrs.body) > @max_issue_body_bytes ->
+        {:error, {:invalid_command_field, :body}}
+
+      not Sxf.Identifiers.valid?(attrs.actor_id) ->
+        {:error, {:invalid_command_field, :actor_id}}
+
+      not is_struct(attrs.received_at, DateTime) ->
+        {:error, {:invalid_command_field, :received_at}}
+
+      not Sxf.Identifiers.valid?(attrs.correlation_id) ->
+        {:error, {:invalid_command_field, :correlation_id}}
+
+      true ->
+        validate_intake_metadata(metadata)
+    end
+  end
+
+  defp valid_intake_string?(value, max_bytes) do
+    is_binary(value) and String.valid?(value) and String.trim(value) != "" and
+      byte_size(value) <= max_bytes
+  end
+
+  defp valid_sha256?(value) do
+    is_binary(value) and String.valid?(value) and
+      Regex.match?(~r/\A[0-9a-f]{64}\z/, value)
+  end
+
+  defp validate_intake_metadata(metadata) when is_map(metadata) do
+    with {:ok, _nodes} <- count_intake_metadata_nodes(metadata, 0, 0),
+         {:ok, encoded} <- Jason.encode(metadata),
+         true <- byte_size(encoded) <= @max_intake_metadata_bytes do
+      :ok
+    else
+      _ -> {:error, {:invalid_command_field, :metadata}}
+    end
+  end
+
+  defp validate_intake_metadata(_metadata),
+    do: {:error, {:invalid_command_field, :metadata}}
+
+  defp count_intake_metadata_nodes(_value, depth, _count)
+       when depth > @max_intake_metadata_depth,
+       do: {:error, :metadata_too_deep}
+
+  defp count_intake_metadata_nodes(_value, _depth, count)
+       when count >= @max_intake_metadata_nodes,
+       do: {:error, :metadata_too_large}
+
+  defp count_intake_metadata_nodes(value, depth, count) when is_map(value) do
+    Enum.reduce_while(value, {:ok, count + 1}, fn
+      {key, nested}, {:ok, current}
+      when is_binary(key) and byte_size(key) <= @max_intake_metadata_string_bytes ->
+        case count_intake_metadata_nodes(nested, depth + 1, current) do
+          {:ok, next} -> {:cont, {:ok, next}}
+          {:error, _} = error -> {:halt, error}
+        end
+
+      _, _acc ->
+        {:halt, {:error, :metadata_not_json}}
+    end)
+  end
+
+  defp count_intake_metadata_nodes(value, depth, count) when is_list(value) do
+    Enum.reduce_while(value, {:ok, count + 1}, fn nested, {:ok, current} ->
+      case count_intake_metadata_nodes(nested, depth + 1, current) do
+        {:ok, next} -> {:cont, {:ok, next}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp count_intake_metadata_nodes(value, _depth, count)
+       when is_binary(value) and byte_size(value) <= @max_intake_metadata_string_bytes,
+       do: {:ok, count + 1}
+
+  defp count_intake_metadata_nodes(value, _depth, count)
+       when is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value),
+       do: {:ok, count + 1}
+
+  defp count_intake_metadata_nodes(_value, _depth, _count),
+    do: {:error, :metadata_not_json}
 
   defp unwrap_or_rollback({:ok, value}), do: value
   defp unwrap_or_rollback({:error, reason}), do: Repo.rollback(reason)

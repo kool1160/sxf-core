@@ -45,7 +45,9 @@ For M3, the local control plane polls only `kool1160/sxf-m3-scratch` for issues 
 stable GitHub repository and issue IDs. Repeated polling reconciles the same task and cannot dispatch
 or create duplicate work. GitHub issue content is untrusted and cannot change platform authority.
 [ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md) defines the intake, identity, and
-safe-failure boundary.
+safe-failure boundary. The provider-neutral atomic inbox-to-`DISCOVERED` task command is implemented;
+GitHub authentication, API transport, polling cadence, label evaluation, and manifest-gated
+promotion remain separate later M3 adapters.
 
 ### State machine
 

@@ -19,12 +19,13 @@ Symphony execution semantics without starting its orchestrator:
 - durable retry deadlines, budgets, usage, leases, fenced execution events, lease renewals,
   blockers, and restart queries;
 - atomic eligible-task and due-retry claims through provider-neutral execution contracts; and
-- inbox/outbox reference records that reserve integration boundaries without implementing them.
+- atomic, provider-neutral external-issue inbox normalization plus outbox reference records that
+  reserve the later external-action boundary.
 
 It deliberately activates no live tracker, agent runtime, repository workspace, sandbox, evidence
-byte store, webhook processor, external-action dispatcher, or user interface. The coordinator is
-tested only with deterministic boundary fakes. The quarantined upstream application is compiled
-for conformance only and is not a second workflow authority.
+byte store, GitHub poller or webhook processor, external-action dispatcher, or user interface. The
+coordinator is tested only with deterministic boundary fakes. The quarantined upstream application
+is compiled for conformance only and is not a second workflow authority.
 
 ## Durable records and identity
 
@@ -50,7 +51,7 @@ session IDs are opaque strings attached to stable SXF IDs; they never become pri
 | `execution_events` | Append-only structured backend facts with attempt-local sequence, lease fencing token, actor, correlation, backend occurrence time, idempotency fingerprint, and payload. Lease authority is checked at trusted control-plane observation time. |
 | `blockers` | Active/resolved stop reason and the state to resume after resolution. |
 | `human_decisions` | Explicit approval, rejection, unblock, cancellation, reopen, deploy, or budget-override decision scoped to one identified transition or blocker-resolution action. |
-| `external_event_inbox_references` | Unique external delivery reference and payload hash for future idempotent intake. |
+| `external_event_inbox_references` | Unique provider observation identity, source version, payload hash, semantic request fingerprint, processing status, and normalized task link. |
 | `external_action_outbox_references` | Unique external action intent, payload hash, due time, and observable outcome status. |
 
 No field is named for GitHub, Linear, Codex, or another concrete provider. Provider-specific values
@@ -67,6 +68,13 @@ common task ID. Commands also reject mismatches before attempting a write. Adapt
 database writes therefore cannot associate an attempt, evidence reference, budget, lease, blocker,
 retry, usage entry, execution event, lease renewal, transition, or outbox action with a different
 task.
+
+For external issue intake, `(repository_registration_id, source_ref)` is unique whenever
+`source_ref` is present. The source reference is the provider-stable issue ID and the repository
+registration is resolved from the provider-stable repository ID. The command inserts the inbox
+observation, creates or finds the task, records the sequence-1 `DISCOVERED` transition, and marks the
+inbox processed in one immediate SQLite transaction. A failed repository, actor, project, task, or
+event check rolls the entire command back.
 
 `task_attempts.execution_event_sequence` is the durable projection version for backend events.
 Accepting an event and incrementing that projection happen in one transaction. The next event must
@@ -184,9 +192,14 @@ different accepted input returns `:idempotency_conflict`.
 
 Task creation, transitions/blocking, attempts, retries, usage entries, blocker resolutions, and
 human decisions persist their request fingerprint beside the idempotency key. Reconciliation derives
-keys and fingerprints from durable identities such as a lease ID. Budget, inbox, outbox, and lease
-records reserve stable keys or natural unique scopes for their future command handlers. Unknown
-outbox state remains `unknown` until observed; it is never inferred to be successful.
+keys and fingerprints from durable identities such as a lease ID. External issue normalization
+derives an observation identity from provider, repository ID, issue ID, and source version. Its
+fingerprint covers all accepted semantic content, including payload hash, title, body, actor, and
+metadata, while excluding fresh receive time and correlation envelopes. Exact replay returns the
+original inbox, task, and creation event; changed semantic content conflicts. A later source version
+creates another inbox observation but reconciles the same task. Budget, outbox, and lease records
+reserve stable keys or natural unique scopes for their command handlers. Unknown outbox state
+remains `unknown` until observed; it is never inferred to be successful.
 
 Dispatch-command fingerprints cover accepted semantic input but deliberately exclude fresh
 control-plane observation times, calculated lease expiries, and generated correlation IDs. An
@@ -222,4 +235,7 @@ scope and durable consumption links, mutations of every accepted idempotent-comm
 same-timestamp transition ordering, evidence attachment, execution leases, cancellation/reopen,
 blocking/unblocking, budget exhaustion, durable retry deadlines, unknown outcomes, stale-lease
 restart reconciliation, inbox/outbox uniqueness, and actual SQLite WAL/foreign-key pragmas. Tests
-supply fixed timestamps and inspect durable rows; no test sleeps.
+also cover atomic issue normalization, exact replay, semantic conflicts, later versions, bounded
+untrusted content, ownership failures, repository-scoped source identity, and simultaneous
+normalization over independent SQLite connections. Tests supply fixed timestamps and inspect
+durable rows; no test sleeps.

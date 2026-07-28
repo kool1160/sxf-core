@@ -462,13 +462,15 @@ defmodule Sxf.Tasks.HumanDecision do
 end
 
 defmodule Sxf.Tasks.ExternalEventInboxReference do
-  @moduledoc "Idempotency metadata for a future external-event inbox processor."
+  @moduledoc "Idempotency metadata for one normalized external issue observation."
   use Sxf.Schema
 
   schema "external_event_inbox_references" do
     field :source, :string
     field :external_id, :string
+    field :source_version, :string
     field :payload_sha256, :string
+    field :request_fingerprint, :string
     field :status, :string, default: "received"
     field :received_at, :utc_datetime_usec
     field :processed_at, :utc_datetime_usec
@@ -485,7 +487,9 @@ defmodule Sxf.Tasks.ExternalEventInboxReference do
       :task_id,
       :source,
       :external_id,
+      :source_version,
       :payload_sha256,
+      :request_fingerprint,
       :status,
       :received_at,
       :processed_at,
@@ -495,13 +499,19 @@ defmodule Sxf.Tasks.ExternalEventInboxReference do
     |> validate_required([
       :source,
       :external_id,
+      :source_version,
       :payload_sha256,
+      :request_fingerprint,
       :status,
       :received_at,
       :correlation_id
     ])
     |> validate_inclusion(:status, ~w(received processed rejected))
+    |> validate_length(:source, min: 1, max: 100)
+    |> validate_length(:external_id, min: 1, max: 255)
+    |> validate_length(:source_version, min: 1, max: 255)
     |> validate_format(:payload_sha256, ~r/\A[0-9a-f]{64}\z/)
+    |> validate_format(:request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:task_id)
     |> unique_constraint([:source, :external_id])
   end

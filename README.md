@@ -61,9 +61,12 @@ durable execution coordinator now atomically claims eligible tasks, invokes prov
 agent/workspace/sandbox backends, persists fenced events and usage, enforces limits, and reconciles
 interrupted attempts without starting Symphony as a competing authority. It also
 loads, strictly validates, normalizes, and applies platform policy ceilings to version `0.1` YAML or
-JSON connected-project manifests without executing their commands. It does not yet contain the
-live agent, GitHub App, repository, or container execution, container workspace
-runtime, or evidence byte store. The pinned Symphony Elixir foundation is retained under
+JSON connected-project manifests without executing their commands. A provider-neutral durable
+intake command now atomically records external issue observations and normalizes one
+repository-scoped `DISCOVERED` task with replay and concurrency protection. It does not yet contain
+the GitHub App authentication or polling adapter, live agent, repository or container execution,
+container workspace runtime, or evidence byte store. The pinned Symphony Elixir foundation is
+retained under
 `upstream/openai-symphony` as a compile-time, default-denied path dependency; it is not started and
 does not replace SXF's durable task authority.
 
