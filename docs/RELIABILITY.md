@@ -18,8 +18,11 @@ SXF must continue operating correctly when agents fail, tools return partial res
 Webhook processing, branch creation, comments, labels, task transitions, workspace creation, and status publication must accept stable idempotency keys. Replaying an event must not duplicate work or corrupt state.
 
 The implemented transition boundary scopes keys to a task and fingerprints the semantic request.
-An exact replay returns the original event; reusing a key for different content is an explicit
-conflict. See [`TASK_DOMAIN.md`](TASK_DOMAIN.md).
+The external-issue intake boundary derives its observation identity from stable provider,
+repository, issue, and source-version values and fingerprints every accepted semantic field. An
+exact replay returns the original durable result; reusing an identity with different content is an
+explicit conflict. Later source versions create new inbox facts while reconciling the same
+repository-scoped task. See [`TASK_DOMAIN.md`](TASK_DOMAIN.md).
 
 ## Failure classes
 

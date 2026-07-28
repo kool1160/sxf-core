@@ -56,7 +56,9 @@ defmodule Sxf.Tasks.RecordsTest do
         task_id: fixture.task.id,
         source: "provider-webhook",
         external_id: "delivery-123",
+        source_version: "version-1",
         payload_sha256: hash,
+        request_fingerprint: hash,
         status: "received",
         received_at: base_time(),
         correlation_id: correlation_id
@@ -87,7 +89,9 @@ defmodule Sxf.Tasks.RecordsTest do
                task_id: fixture.task.id,
                source: inbox.source,
                external_id: inbox.external_id,
+               source_version: inbox.source_version,
                payload_sha256: hash,
+               request_fingerprint: hash,
                status: "received",
                received_at: base_time(),
                correlation_id: correlation_id
