@@ -3,11 +3,18 @@ defmodule Sxf.Tasks.IntakeTest do
 
   alias Sxf.Repo
   alias Sxf.Tasks
+  alias Sxf.Tasks.Blocker
+  alias Sxf.Tasks.Budget
+  alias Sxf.Tasks.ExternalActionOutboxReference
   alias Sxf.Tasks.ExternalEventInboxReference
   alias Sxf.Tasks.Project
   alias Sxf.Tasks.RepositoryRegistration
+  alias Sxf.Tasks.RetrySchedule
   alias Sxf.Tasks.Task
+  alias Sxf.Tasks.TaskAttempt
   alias Sxf.Tasks.TransitionEvent
+  alias Sxf.Tasks.UsageEntry
+  alias Sxf.Tasks.WorkerLease
 
   setup do
     project =
@@ -81,6 +88,27 @@ defmodule Sxf.Tasks.IntakeTest do
     assert Repo.aggregate(ExternalEventInboxReference, :count) == 1
     assert Repo.aggregate(Task, :count) == 1
     assert Repo.aggregate(TransitionEvent, :count) == 1
+  end
+
+  test "normalized DISCOVERED task is restart-visible without execution authority", fixture do
+    attrs = intake_attrs(fixture)
+
+    assert {:ok, %{task: task}} = Tasks.normalize_external_issue(attrs)
+
+    snapshot = Tasks.restart_snapshot(DateTime.add(attrs.received_at, 1, :second))
+
+    assert Enum.map(snapshot.tasks, & &1.id) == [task.id]
+    assert snapshot.due_retries == []
+    assert snapshot.stale_leases == []
+    assert snapshot.pending_outbox == []
+
+    assert Repo.aggregate(TaskAttempt, :count) == 0
+    assert Repo.aggregate(WorkerLease, :count) == 0
+    assert Repo.aggregate(RetrySchedule, :count) == 0
+    assert Repo.aggregate(Blocker, :count) == 0
+    assert Repo.aggregate(Budget, :count) == 0
+    assert Repo.aggregate(UsageEntry, :count) == 0
+    assert Repo.aggregate(ExternalActionOutboxReference, :count) == 0
   end
 
   test "exact observation replay returns the original durable result without duplicate rows",
