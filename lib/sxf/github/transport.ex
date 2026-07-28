@@ -82,6 +82,11 @@ defmodule Sxf.GitHub.HttpcTransport do
 
   @impl true
   def request(request) do
+    request(request, &:httpc.request/4)
+  end
+
+  @doc false
+  def request(request, request_fun) when is_function(request_fun, 4) do
     url = String.to_charlist(@api_base_url <> request.path)
 
     headers =
@@ -96,10 +101,16 @@ defmodule Sxf.GitHub.HttpcTransport do
           {url, headers}
       end
 
-    http_options = [timeout: 15_000, connect_timeout: 5_000, autoredirect: false]
+    http_options = [
+      timeout: 15_000,
+      connect_timeout: 5_000,
+      autoredirect: false,
+      autoretry: 0
+    ]
+
     request_options = [body_format: :binary]
 
-    case :httpc.request(request.method, http_request, http_options, request_options) do
+    case request_fun.(request.method, http_request, http_options, request_options) do
       {:ok, {{_http_version, status, _reason_phrase}, response_headers, body}} ->
         {:ok,
          %{
