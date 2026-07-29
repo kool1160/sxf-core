@@ -24,6 +24,15 @@ task. Never provide workers, prompts, models, workspaces, logs, or evidence with
 or a broad personal credential. See
 [`ADR 0005`](decisions/0005-github-app-intake-and-local-hosting.md).
 
+The one-shot intake adapter signs an RS256 App JWT from an injected private-key resolver and trusted
+clock, then requests one installation token for only the durable GitHub repository database ID.
+The requested material permissions are Contents write, Issues read, and Pull requests write;
+Metadata read is GitHub's implicit permission. Token responses exposing another repository,
+all-repository selection, another installation, or broader material permissions fail closed.
+Installation tokens are opaque and exist only in a redacting in-memory value. Authorization
+headers, App JWTs, private keys, and installation tokens are absent from public poll results,
+durable inbox/task metadata, errors, and logs. Intake never falls back to a personal token.
+
 ### Secret handling
 
 - Never place secrets in prompts, logs, commits, evidence artifacts, or model-visible context unless strictly required and policy-approved.
@@ -97,6 +106,12 @@ policy-invalid manifest failures stop intake safely. Rate limits honor provider 
 information; authentication failures do not fall back to personal credentials; unknown repository
 state does not create executable work. Polling and any later webhook adapter must share the same
 idempotent durable inbox and cannot become workflow authorities.
+
+The M3 poller fetches the complete configured page/observation window before it persists any
+observation. A later-page error, pagination overflow, repository identity mismatch, rename/transfer,
+or uncertain provider response therefore cannot turn an earlier partial response into a task.
+Malformed individual issue objects are isolated only after repository and pagination authority are
+known. See [`GITHUB_ISSUE_INTAKE.md`](GITHUB_ISSUE_INTAKE.md).
 
 ## Threats to address before production use
 

@@ -15,7 +15,7 @@ defmodule SxfCore.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, :crypto, :public_key, :inets, :ssl],
       mod: {Sxf.Application, []}
     ]
   end
