@@ -20,10 +20,13 @@ Symphony execution semantics without starting its orchestrator:
   blockers, and restart queries;
 - atomic eligible-task and due-retry claims through provider-neutral execution contracts; and
 - atomic, provider-neutral external-issue inbox normalization plus outbox reference records that
-  reserve the later external-action boundary.
+  reserve the later external-action boundary; and
+- atomic manifest-gated preparation that pins accepted repository/source authority, creates one
+  task budget, and advances `DISCOVERED -> SPECIFIED -> PLANNED -> READY`.
 
-It deliberately activates no live tracker, agent runtime, repository workspace, sandbox, evidence
-byte store, GitHub poller or webhook processor, external-action dispatcher, or user interface. The
+It deliberately activates no live tracker, recurring poll process, agent runtime, repository
+workspace, sandbox, evidence byte store, webhook processor, external-action dispatcher, or user
+interface. The one-shot GitHub poller and task-preparation command require explicit calls. The
 coordinator is tested only with deterministic boundary fakes. The quarantined upstream application
 is compiled for conformance only and is not a second workflow authority.
 
@@ -39,6 +42,7 @@ session IDs are opaque strings attached to stable SXF IDs; they never become pri
 | `repository_registrations` | Stable repository ID plus opaque provider/external identity. Unique by `(provider, external_id)`. |
 | `actors` | Stable identity for a human, system, worker, agent backend, or external system. |
 | `tasks` | Current task projection, saved resume state, terminal timestamp, monotonic transition sequence, and optimistic lock version. |
+| `task_preparations` | Immutable task-owned manifest/source contract and semantic fingerprint that authorized the first promotion to `READY`. |
 | `task_attempts` | Ordered, bounded execution/repair attempt with opaque backend/session references and the durable absolute runtime deadline. |
 | `task_transition_events` | Append-oriented prior/result state fact with a task-local sequence, actor, reason, time, correlation, idempotency key, request fingerprint, and any authorizing human-decision reference. |
 | `evidence_references` | Immutable evidence metadata: kind, content hash, storage URI, producer, task/attempt, size, and finalization time. |
@@ -125,6 +129,17 @@ indexes, non-null columns, and optimistic locks provide database-level structura
 SQLite cannot add portable `CHECK` constraints through the chosen Ecto adapter, so enum membership
 is deliberately enforced in changesets and the state machine rather than a SQLite-only trigger.
 
+`Sxf.TaskPreparation.prepare/1` owns the first lifecycle promotion after external intake. One
+immediate transaction inserts the immutable preparation and task budget, then appends the legal
+`SPECIFIED`, `PLANNED`, and `READY` facts. Its authority is the active task-owned project, complete
+accepted repository registration, normalized manifest, and one unambiguous processed inbox
+observation. Multiple source versions instead create an `operator_input` blocker; invalid manifest
+authority creates a `policy` blocker. Each failure atomically appends `DISCOVERED -> BLOCKED` and
+creates no preparation or budget.
+Composite foreign keys enforce task/project, registration/project, and inbox/task ownership.
+Exact semantic replay returns the original records; changed authority conflicts. See
+[`TASK_PREPARATION.md`](TASK_PREPARATION.md).
+
 ## Lifecycle
 
 The creation edge is `nil -> DISCOVERED`. The following table is exhaustive. “Operational stop”
@@ -201,10 +216,17 @@ creates another inbox observation but reconciles the same task. Budget, outbox, 
 reserve stable keys or natural unique scopes for their command handlers. Unknown outbox state
 remains `unknown` until observed; it is never inferred to be successful.
 
-Dispatch-command fingerprints cover accepted semantic input but deliberately exclude fresh
-control-plane observation times, calculated lease expiries, and generated correlation IDs. An
-exact dispatch replay returns the durable claim without repeating external preparation or agent
-execution. Changed accepted dispatch input conflicts.
+Dispatch-command fingerprints cover the frozen preparation semantic fingerprint together with the
+worker, actor, and backend, but deliberately exclude fresh control-plane observation times,
+calculated lease expiries, and generated correlation IDs. Caller dispatch input is rejected. An
+exact dispatch replay returns the durable claim and contract without repeating external
+preparation or agent execution.
+
+Task preparation is naturally unique by task ID. Its semantic fingerprint includes the accepted
+registration, sole processed source observation, preparing actor, ordered command plan, and
+effective contract while
+excluding fresh time, correlation, and idempotency envelopes. Independent concurrent writers
+therefore produce one preparation, budget, and transition sequence.
 
 ## Evidence rules
 

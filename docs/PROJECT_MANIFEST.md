@@ -162,6 +162,22 @@ Repository metadata updates, manifest-version replacement, owner/name reconcilia
 or transfer, and retirement/re-registration rules are deliberately deferred. A changed command may
 not silently update an accepted registration.
 
+## Manifest-gated task preparation
+
+`Sxf.TaskPreparation` consumes only the registration's persisted normalized snapshot. It does not
+reload repository bytes or trust issue text to supply commands or policy. Before a `DISCOVERED`
+external-issue task can become `READY`, the gate requires inert install/test commands, effective
+branch and pull-request authority, mandatory verification, and budgets within ADR 0004's M3
+ceilings. It additionally rejects merge-to-default and production-deployment authority. It creates
+one exact task budget, pins the registration fingerprint in the immutable preparation contract,
+and stores commands in deterministic execution order.
+
+Preparation never executes a command. Multiple processed source versions create an
+`operator_input` blocker; invalid manifest authority creates a `policy` blocker. Both failures move
+the task from `DISCOVERED` to `BLOCKED` without a preparation or budget. Changed registration or
+source semantics conflict rather than silently replacing already prepared work. See
+[`TASK_PREPARATION.md`](TASK_PREPARATION.md).
+
 ## Safety boundary
 
 Validation performs only bounded file metadata/read operations, isolated parsing, decoded-structure
@@ -184,6 +200,7 @@ example test, YAML/JSON equivalence, strict schema failures, budget/verification
 regressions, decoded-structure and YAML-reference limits, non-execution and non-mutation regression,
 dependency audit, compilation without warnings, and full test suite.
 
-M3 adds only caller-supplied durable registration and lookup around that pure result. Live manifest
-discovery, repository updates, GitHub authentication/API integration, command execution, workspace
-creation, sandbox enforcement, and scheduler integration remain explicitly out of scope.
+M3 adds caller-supplied durable registration and lookup around that pure result and consumes the
+normalized snapshot through the task-preparation gate. Live manifest discovery, repository
+updates, command execution, workspace creation, sandbox enforcement, and live execution
+integration remain explicitly out of scope.

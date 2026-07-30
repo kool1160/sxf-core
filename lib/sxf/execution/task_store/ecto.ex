@@ -13,10 +13,14 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     Blocker,
     Budget,
     ExecutionEvent,
+    ExternalEventInboxReference,
     LeaseRenewal,
+    RepositoryRegistration,
     RetrySchedule,
     Task,
     TaskAttempt,
+    TaskPreparation,
+    TransitionEvent,
     UsageEntry,
     WorkerLease
   }
@@ -35,22 +39,13 @@ defmodule Sxf.Execution.TaskStore.Ecto do
              :correlation_id,
              :idempotency_key
            ]),
-         :ok <- validate_claim_times(attrs) do
-      request_fingerprint =
-        fingerprint(%{
-          command: :claim_next,
-          worker_id: attrs.worker_id,
-          actor_id: attrs.actor_id,
-          backend: attrs.backend,
-          idempotency_key: attrs.idempotency_key,
-          dispatch_input: Map.get(attrs, :dispatch_input, %{})
-        })
-
+         :ok <- validate_claim_times(attrs),
+         :ok <- validate_dispatch_input(attrs) do
       try do
         Repo.transaction(fn ->
           case existing_claim(attrs.idempotency_key) do
-            nil -> create_claim(attrs, request_fingerprint)
-            lease -> replay_claim(lease, request_fingerprint)
+            nil -> create_claim(attrs)
+            lease -> replay_claim(lease, attrs)
           end
         end)
         |> flatten()
@@ -138,7 +133,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
         Repo.rollback(:stale_backend_event)
       end
 
-      load_claim(lease)
+      load_claim_or_rollback(lease)
     end)
     |> flatten()
   end
@@ -193,7 +188,12 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     |> where([lease], lease.worker_id == ^worker_id and lease.status == "active")
     |> order_by([lease], asc: lease.acquired_at, asc: lease.id)
     |> Repo.all()
-    |> Enum.map(&load_claim/1)
+    |> Enum.map(fn lease ->
+      case load_claim(lease) do
+        {:ok, claim} -> claim
+        {:error, recovery_claim, reason} -> {:error, recovery_claim, reason}
+      end
+    end)
   end
 
   @impl true
@@ -222,16 +222,16 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     end)
   end
 
-  defp create_claim(attrs, request_fingerprint) do
+  defp create_claim(attrs) do
     case due_retry(attrs.occurred_at) || ready_task() do
       nil ->
         nil
 
-      %RetrySchedule{} = retry ->
-        claim_retry(retry, attrs, request_fingerprint)
+      {%RetrySchedule{} = retry, %Task{} = task, authority} ->
+        claim_retry(retry, task, authority, attrs)
 
-      %Task{} = task ->
-        claim_task(task, nil, attrs, request_fingerprint)
+      {%Task{} = task, authority} ->
+        claim_task(task, nil, authority, attrs)
     end
   end
 
@@ -240,7 +240,14 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     |> where([task], task.state == "READY")
     |> order_by([task], asc: task.last_transition_at, asc: task.id)
     |> Repo.all()
-    |> Enum.find(&eligible_task?/1)
+    |> Enum.find_value(fn task ->
+      with {:ok, authority} <- preparation_authority(task, true),
+           true <- eligible_task?(task, authority) do
+        {task, authority}
+      else
+        _ -> nil
+      end
+    end)
   end
 
   defp due_retry(observed_at) do
@@ -252,18 +259,24 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     )
     |> order_by([retry], asc: retry.due_at, asc: retry.sequence, asc: retry.id)
     |> Repo.all()
-    |> Enum.find(fn retry ->
-      Task
-      |> Repo.get!(retry.task_id)
-      |> eligible_retry_task?()
+    |> Enum.find_value(fn retry ->
+      task = Repo.get!(Task, retry.task_id)
+
+      with {:ok, authority} <- preparation_authority(task, true),
+           true <- eligible_retry_task?(task, authority) do
+        {retry, task, authority}
+      else
+        _ -> nil
+      end
     end)
   end
 
-  defp eligible_task?(task) do
-    no_active_lease?(task.id) and no_active_attempt?(task.id) and budget_available?(task.id)
+  defp eligible_task?(task, authority) do
+    no_active_lease?(task.id) and no_active_attempt?(task.id) and
+      budget_capacity?(authority.budget)
   end
 
-  defp eligible_retry_task?(task) do
+  defp eligible_retry_task?(task, authority) do
     active_blockers =
       Repo.all(
         from blocker in Blocker, where: blocker.task_id == ^task.id and blocker.status == "active"
@@ -271,7 +284,8 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
     active_blockers != [] and
       Enum.all?(active_blockers, &(&1.kind in @auto_resolvable_blockers)) and
-      no_active_lease?(task.id) and no_active_attempt?(task.id) and budget_available?(task.id)
+      no_active_lease?(task.id) and no_active_attempt?(task.id) and
+      budget_capacity?(authority.budget)
   end
 
   defp no_active_lease?(task_id) do
@@ -287,9 +301,167 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     )
   end
 
-  defp claim_retry(retry, attrs, request_fingerprint) do
-    task = Repo.get!(Task, retry.task_id)
+  defp preparation_authority(task, require_active_budget?) do
+    with {:ok, authority} <- frozen_preparation_authority(task, require_active_budget?),
+         %RepositoryRegistration{} = registration <-
+           Repo.get(
+             RepositoryRegistration,
+             authority.preparation.repository_registration_id
+           ),
+         true <- registration.project_id == task.project_id,
+         true <- registration.id == task.repository_registration_id,
+         true <-
+           registration.registration_fingerprint ==
+             authority.preparation.registration_fingerprint,
+         false <- newer_processed_source_observation?(authority.preparation) do
+      {:ok, authority}
+    else
+      _ -> {:error, :task_preparation_authority_invalid}
+    end
+  end
 
+  defp frozen_preparation_authority(task, require_active_budget?) do
+    preparations =
+      Repo.all(
+        from preparation in TaskPreparation,
+          where: preparation.task_id == ^task.id,
+          order_by: preparation.id
+      )
+
+    with [preparation] <- preparations,
+         true <- complete_preparation?(task, preparation),
+         {:ok, budget} <-
+           preparation_budget(task.id, preparation, require_active_budget?) do
+      {:ok, %{preparation: preparation, budget: budget}}
+    else
+      _ -> {:error, :task_preparation_authority_invalid}
+    end
+  end
+
+  defp load_claim_or_rollback(lease) do
+    case load_claim(lease) do
+      {:ok, claim} -> claim
+      {:error, _recovery_claim, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp complete_preparation?(task, preparation) do
+    source = Repo.get(ExternalEventInboxReference, preparation.source_inbox_id)
+    contract = preparation.contract
+
+    task.id == preparation.task_id and
+      task.project_id == preparation.project_id and
+      task.repository_registration_id == preparation.repository_registration_id and
+      preparation.manifest_schema_version == "0.1" and
+      valid_fingerprint?(preparation.registration_fingerprint) and
+      valid_fingerprint?(preparation.source_payload_sha256) and
+      valid_fingerprint?(preparation.semantic_fingerprint) and
+      is_map(contract) and
+      preparation.semantic_fingerprint == preparation_semantic_fingerprint(preparation) and
+      get_in(contract, ["task", "id"]) == task.id and
+      get_in(contract, ["repository", "registrationId"]) ==
+        preparation.repository_registration_id and
+      source_matches_preparation?(source, preparation) and
+      preparation_events_complete?(preparation)
+  end
+
+  defp source_matches_preparation?(
+         %ExternalEventInboxReference{} = source,
+         preparation
+       ) do
+    source.task_id == preparation.task_id and source.status == "processed" and
+      source.source_version == preparation.source_version and
+      source.payload_sha256 == preparation.source_payload_sha256
+  end
+
+  defp source_matches_preparation?(_source, _preparation), do: false
+
+  defp preparation_events_complete?(preparation) do
+    events =
+      Repo.all(
+        from event in TransitionEvent,
+          where:
+            event.task_id == ^preparation.task_id and
+              event.idempotency_key in ^preparation_event_keys(preparation.id),
+          order_by: event.sequence
+      )
+
+    Enum.map(events, fn event ->
+      {
+        event.prior_state,
+        event.resulting_state,
+        event.metadata["preparation_id"],
+        event.metadata["semantic_fingerprint"]
+      }
+    end) == [
+      {"DISCOVERED", "SPECIFIED", preparation.id, preparation.semantic_fingerprint},
+      {"SPECIFIED", "PLANNED", preparation.id, preparation.semantic_fingerprint},
+      {"PLANNED", "READY", preparation.id, preparation.semantic_fingerprint}
+    ]
+  end
+
+  defp preparation_event_keys(preparation_id) do
+    for state <- ~w(specified planned ready), do: "preparation:#{preparation_id}:#{state}"
+  end
+
+  defp preparation_budget(task_id, preparation, require_active_budget?) do
+    case budgets_for(task_id, nil) do
+      [budget] ->
+        if budget.metadata["preparation_id"] == preparation.id and
+             budget.metadata["registration_fingerprint"] ==
+               preparation.registration_fingerprint and
+             budget_matches_contract?(budget, preparation.contract) and
+             (not require_active_budget? or budget.status == "active") do
+          {:ok, budget}
+        else
+          {:error, :task_preparation_budget_invalid}
+        end
+
+      _ ->
+        {:error, :task_preparation_budget_invalid}
+    end
+  end
+
+  defp budget_matches_contract?(budget, contract) do
+    contract_budget = contract["budgets"]
+
+    is_map(contract_budget) and
+      budget.max_cost_microusd == contract_budget["maxCostMicrousd"] and
+      budget.max_runtime_ms == contract_budget["maxRuntimeMs"] and
+      budget.max_agent_turns == contract_budget["maxAgentTurns"] and
+      budget.max_repair_cycles == contract_budget["maxRepairCycles"] and
+      budget.max_provider_retries == contract_budget["maxProviderRetries"]
+  end
+
+  defp newer_processed_source_observation?(preparation) do
+    Repo.exists?(
+      from inbox in ExternalEventInboxReference,
+        where:
+          inbox.task_id == ^preparation.task_id and inbox.status == "processed" and
+            inbox.source_version > ^preparation.source_version
+    )
+  end
+
+  defp valid_fingerprint?(value) do
+    is_binary(value) and Regex.match?(~r/\A[0-9a-f]{64}\z/, value)
+  end
+
+  defp preparation_semantic_fingerprint(preparation) do
+    fingerprint(%{
+      command: :prepare_task,
+      task_id: preparation.task_id,
+      project_id: preparation.project_id,
+      repository_registration_id: preparation.repository_registration_id,
+      registration_fingerprint: preparation.registration_fingerprint,
+      source_inbox_id: preparation.source_inbox_id,
+      source_version: preparation.source_version,
+      source_payload_sha256: preparation.source_payload_sha256,
+      actor_id: preparation.prepared_by_actor_id,
+      contract: preparation.contract
+    })
+  end
+
+  defp claim_retry(retry, task, authority, attrs) do
     Repo.all(
       from blocker in Blocker, where: blocker.task_id == ^task.id and blocker.status == "active"
     )
@@ -311,12 +483,15 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     })
     |> update!()
 
-    claim = claim_task(task, retry, attrs, request_fingerprint)
+    claim = claim_task(task, retry, authority, attrs)
     exhaust_fired_retry_budgets(retry.id)
     %{claim | budgets: budgets_for(task.id, claim.attempt.id)}
   end
 
-  defp claim_task(task, retry, attrs, request_fingerprint) do
+  defp claim_task(task, retry, authority, attrs) do
+    request_fingerprint =
+      claim_request_fingerprint(attrs, authority.preparation.semantic_fingerprint)
+
     attempt_sequence =
       Repo.one(
         from attempt in TaskAttempt,
@@ -378,15 +553,21 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       attempt: attempt,
       lease: lease,
       budgets: budgets_for(task.id, attempt.id),
+      preparation: authority.preparation,
+      preparation_contract: authority.preparation.contract,
+      preparation_fingerprint: authority.preparation.semantic_fingerprint,
       runtime_deadline_at: attempt.runtime_deadline_at,
       renewal_sequence: 0,
       replayed?: false
     }
   end
 
-  defp replay_claim(lease, request_fingerprint) do
+  defp replay_claim(lease, attrs) do
+    claim = load_claim_or_rollback(lease)
+    request_fingerprint = claim_request_fingerprint(attrs, claim.preparation_fingerprint)
+
     if lease.request_fingerprint == request_fingerprint do
-      %{load_claim(lease) | replayed?: true}
+      %{claim | replayed?: true}
     else
       Repo.rollback(:idempotency_conflict)
     end
@@ -400,14 +581,27 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
   defp load_claim(lease) do
     attempt = Repo.get!(TaskAttempt, lease.attempt_id)
-
+    task = Repo.get!(Task, lease.task_id)
     budgets = budgets_for(lease.task_id, attempt.id)
 
+    case frozen_preparation_authority(task, false) do
+      {:ok, authority} ->
+        {:ok, build_loaded_claim(task, attempt, lease, budgets, authority.preparation)}
+
+      {:error, reason} ->
+        {:error, build_loaded_claim(task, attempt, lease, budgets, nil), reason}
+    end
+  end
+
+  defp build_loaded_claim(task, attempt, lease, budgets, preparation) do
     %Claim{
-      task: Repo.get!(Task, lease.task_id),
+      task: task,
       attempt: attempt,
       lease: lease,
       budgets: budgets,
+      preparation: preparation,
+      preparation_contract: preparation && preparation.contract,
+      preparation_fingerprint: preparation && preparation.semantic_fingerprint,
       runtime_deadline_at:
         attempt.runtime_deadline_at || initial_runtime_deadline(lease.task_id, attempt.started_at),
       renewal_sequence:
@@ -829,11 +1023,6 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     )
   end
 
-  defp budget_available?(task_id) do
-    budgets = budgets_for(task_id, nil)
-    budgets != [] and Enum.all?(budgets, &budget_capacity?/1)
-  end
-
   defp budget_capacity?(budget) do
     budget.status == "active" and
       Enum.all?(~w(cost_microusd runtime_ms agent_turns), fn metric ->
@@ -963,6 +1152,14 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
   defp validate_claim_times(_attrs), do: {:error, :invalid_claim_time}
 
+  defp validate_dispatch_input(attrs) do
+    case Map.get(attrs, :dispatch_input, %{}) do
+      nil -> :ok
+      dispatch_input when dispatch_input == %{} -> :ok
+      _ -> {:error, :dispatch_input_not_authorized}
+    end
+  end
+
   defp validate_renewal_times(%{
          renewed_at: %DateTime{} = renewed_at,
          expires_at: %DateTime{} = expires_at
@@ -1007,6 +1204,17 @@ defmodule Sxf.Execution.TaskStore.Ecto do
       actor_id: attrs.actor_id,
       correlation_id: attrs.correlation_id,
       event: Map.from_struct(event)
+    })
+  end
+
+  defp claim_request_fingerprint(attrs, preparation_fingerprint) do
+    fingerprint(%{
+      command: :claim_next,
+      worker_id: attrs.worker_id,
+      actor_id: attrs.actor_id,
+      backend: attrs.backend,
+      idempotency_key: attrs.idempotency_key,
+      preparation_fingerprint: preparation_fingerprint
     })
   end
 

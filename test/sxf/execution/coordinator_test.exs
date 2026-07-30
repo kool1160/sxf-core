@@ -1,19 +1,23 @@
 defmodule Sxf.Execution.CoordinatorTest do
   use Sxf.DataCase, async: false
 
-  alias Sxf.Execution.{Claim, Coordinator, Event}
+  alias Sxf.Execution.{Claim, Context, Coordinator, Event}
   alias Sxf.Execution.TaskStore.Ecto, as: TaskStore
   alias Sxf.ExecutionFakes.{Agent, AgentWithoutResume, Sandbox, Workspace}
   alias Sxf.Repo
+  alias Sxf.Tasks
   alias Sxf.Tasks.Task, as: DomainTask
 
   alias Sxf.Tasks.{
     Blocker,
     Budget,
     ExecutionEvent,
+    ExternalEventInboxReference,
     LeaseRenewal,
     RetrySchedule,
+    TaskPreparation,
     TaskAttempt,
+    TransitionEvent,
     UsageEntry,
     WorkerLease
   }
@@ -34,9 +38,13 @@ defmodule Sxf.Execution.CoordinatorTest do
   test "claim, attempt, lease, and transition are atomic and generated values do not break replay" do
     fixture = ready_fixture()
     budget_fixture(fixture.task)
-    attrs = Map.put(claim_attrs(fixture, "atomic"), :dispatch_input, %{task_contract: "same"})
+    attrs = claim_attrs(fixture, "atomic")
 
     assert {:ok, %Claim{replayed?: false} = first} = TaskStore.claim_next(attrs)
+    preparation = Repo.get!(TaskPreparation, fixture.preparation.id)
+    assert first.preparation.id == fixture.preparation.id
+    assert first.preparation_contract == preparation.contract
+    assert first.preparation_fingerprint == preparation.semantic_fingerprint
     assert {:ok, %Claim{replayed?: true} = replay} = TaskStore.claim_next(attrs)
     assert replay.attempt.id == first.attempt.id
     assert replay.lease.id == first.lease.id
@@ -50,16 +58,183 @@ defmodule Sxf.Execution.CoordinatorTest do
 
     assert {:ok, %Claim{replayed?: true}} = TaskStore.claim_next(generated_values_changed)
 
-    assert {:error, :idempotency_conflict} =
-             TaskStore.claim_next(%{
-               generated_values_changed
-               | dispatch_input: %{task_contract: "changed"}
-             })
+    assert {:error, :dispatch_input_not_authorized} =
+             TaskStore.claim_next(
+               Map.put(generated_values_changed, :dispatch_input, %{task_contract: "changed"})
+             )
 
     assert Repo.aggregate(TaskAttempt, :count) == 1
     assert Repo.aggregate(WorkerLease, :count) == 1
     assert Repo.get!(DomainTask, fixture.task.id).state == "IMPLEMENTING"
     assert {:ok, nil} = TaskStore.claim_next(claim_attrs(fixture, "duplicate-tick"))
+  end
+
+  test "claim idempotency includes the frozen preparation semantic fingerprint" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task)
+    attrs = claim_attrs(fixture, "preparation-fingerprint")
+
+    assert {:ok, %Claim{} = claim} = TaskStore.claim_next(attrs)
+    preparation = Repo.get!(TaskPreparation, fixture.preparation.id)
+    changed_contract = Map.put(preparation.contract, "fixtureRevision", 2)
+    changed_fingerprint = preparation_semantic_fingerprint(preparation, changed_contract)
+
+    preparation
+    |> Ecto.Changeset.change(
+      contract: changed_contract,
+      semantic_fingerprint: changed_fingerprint
+    )
+    |> Repo.update!()
+
+    TransitionEvent
+    |> where(
+      [event],
+      event.task_id == ^fixture.task.id and
+        event.idempotency_key in ^[
+          "preparation:#{fixture.preparation.id}:specified",
+          "preparation:#{fixture.preparation.id}:planned",
+          "preparation:#{fixture.preparation.id}:ready"
+        ]
+    )
+    |> Repo.all()
+    |> Enum.each(fn event ->
+      event
+      |> Ecto.Changeset.change(
+        metadata: Map.put(event.metadata, "semantic_fingerprint", changed_fingerprint)
+      )
+      |> Repo.update!()
+    end)
+
+    assert claim.preparation_fingerprint != changed_fingerprint
+    assert {:error, :idempotency_conflict} = TaskStore.claim_next(attrs)
+    assert Repo.aggregate(TaskAttempt, :count) == 1
+    assert Repo.aggregate(WorkerLease, :count) == 1
+  end
+
+  test "READY tasks without exactly one complete preparation and active preparation budget are not claimable" do
+    no_preparation = domain_fixture()
+
+    {:ok, %{task: task}} =
+      transition(no_preparation.task, no_preparation.system_actor, "SPECIFIED", 1)
+
+    {:ok, %{task: task}} = transition(task, no_preparation.system_actor, "PLANNED", 2)
+    {:ok, %{task: task}} = transition(task, no_preparation.system_actor, "READY", 3)
+    budget_fixture(task)
+    no_preparation = %{no_preparation | task: task}
+
+    assert {:ok, nil} =
+             TaskStore.claim_next(claim_attrs(no_preparation, "missing-preparation"))
+
+    incomplete = ready_fixture()
+    budget_fixture(incomplete.task)
+
+    incomplete_event =
+      Repo.get_by!(TransitionEvent,
+        task_id: incomplete.task.id,
+        idempotency_key: "preparation:#{incomplete.preparation.id}:planned"
+      )
+
+    Repo.delete!(incomplete_event)
+
+    assert {:ok, nil} =
+             TaskStore.claim_next(claim_attrs(incomplete, "incomplete-preparation"))
+
+    inactive_budget = ready_fixture()
+    budget = budget_fixture(inactive_budget.task)
+
+    budget
+    |> Budget.changeset(%{status: "closed"})
+    |> Repo.update!()
+
+    assert {:ok, nil} =
+             TaskStore.claim_next(claim_attrs(inactive_budget, "inactive-preparation-budget"))
+
+    duplicate_budget = ready_fixture()
+    budget_fixture(duplicate_budget.task)
+
+    %Budget{}
+    |> Budget.changeset(%{
+      id: uuid(),
+      task_id: duplicate_budget.task.id,
+      idempotency_key: "unrelated-active-budget",
+      max_runtime_ms: 1_000
+    })
+    |> Repo.insert!()
+
+    assert {:ok, nil} =
+             TaskStore.claim_next(claim_attrs(duplicate_budget, "duplicate-task-budget"))
+
+    assert Repo.aggregate(TaskAttempt, :count) == 0
+    assert Repo.aggregate(WorkerLease, :count) == 0
+  end
+
+  test "changed registration fingerprint and newer processed source observation revoke claim eligibility" do
+    changed_registration = ready_fixture()
+    budget_fixture(changed_registration.task)
+
+    changed_registration.repository
+    |> Ecto.Changeset.change(registration_fingerprint: String.duplicate("d", 64))
+    |> Repo.update!()
+
+    assert {:ok, nil} =
+             TaskStore.claim_next(claim_attrs(changed_registration, "changed-registration"))
+
+    newer_source = ready_fixture()
+    budget_fixture(newer_source.task)
+
+    assert {:ok, %{task: same_task}} =
+             Tasks.normalize_external_issue(%{
+               provider: newer_source.repository.provider,
+               repository_external_id: newer_source.repository.external_id,
+               issue_external_id: newer_source.task.source_ref,
+               source_version: "2026-07-20T20:00:02Z",
+               payload_sha256: String.duplicate("c", 64),
+               title: "Newer source observation",
+               body: "This version requires a new operator decision.",
+               actor_id: newer_source.system_actor.id,
+               received_at: DateTime.add(base_time(), 2, :second),
+               correlation_id: uuid(),
+               metadata: %{}
+             })
+
+    assert same_task.id == newer_source.task.id
+
+    assert Repo.aggregate(
+             from(inbox in ExternalEventInboxReference,
+               where: inbox.task_id == ^newer_source.task.id and inbox.status == "processed"
+             ),
+             :count
+           ) == 2
+
+    assert {:ok, nil} =
+             TaskStore.claim_next(claim_attrs(newer_source, "newer-source"))
+
+    assert Repo.aggregate(TaskAttempt, :count) == 0
+    assert Repo.aggregate(WorkerLease, :count) == 0
+  end
+
+  test "coordinator passes the frozen preparation contract through provider-neutral context" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task)
+
+    {coordinator, _supervisor} =
+      start_coordinator(fixture,
+        scenario: :hanging,
+        notify: self(),
+        capture_context: self()
+      )
+
+    assert {:ok, %{status: :accepted}} = Coordinator.tick(coordinator)
+    assert_receive {:agent_started, worker}
+    assert_receive {:agent_context, %Context{} = context}
+    preparation = Repo.get!(TaskPreparation, fixture.preparation.id)
+    assert context.preparation.id == fixture.preparation.id
+    assert context.preparation_contract == preparation.contract
+    assert context.preparation_fingerprint == preparation.semantic_fingerprint
+    assert context.claim.preparation_contract == context.preparation_contract
+
+    send(worker, :continue)
+    assert {:ok, [_completion]} = Coordinator.await_idle(coordinator)
   end
 
   test "concurrent claims cannot create duplicate active attempts" do
@@ -773,26 +948,25 @@ defmodule Sxf.Execution.CoordinatorTest do
     assert {:ok, [_]} = Coordinator.await_idle(coordinator)
   end
 
-  test "dispatch key reuse with changed accepted input conflicts" do
+  test "caller dispatch input cannot override durable preparation authority" do
     fixture = ready_fixture()
     budget_fixture(fixture.task)
     {coordinator, _supervisor} = start_coordinator(fixture, scenario: :blocking, notify: self())
     key = "dispatch:changed-input"
 
-    assert {:ok, %{status: :accepted}} =
+    assert {:error, {:claim_failed, :dispatch_input_not_authorized}} =
              Coordinator.tick(coordinator,
                idempotency_key: key,
                dispatch_input: %{task_contract: "one"}
              )
 
+    refute_receive :workspace_prepare
+    refute_receive {:agent_started, _}
+    assert Repo.aggregate(TaskAttempt, :count) == 0
+    assert Repo.aggregate(WorkerLease, :count) == 0
+
+    assert {:ok, %{status: :accepted}} = Coordinator.tick(coordinator, idempotency_key: key)
     assert_receive {:agent_started, worker}
-
-    assert {:error, {:claim_failed, :idempotency_conflict}} =
-             Coordinator.tick(coordinator,
-               idempotency_key: key,
-               dispatch_input: %{task_contract: "two"}
-             )
-
     send(worker, :continue)
     assert {:ok, [_]} = Coordinator.await_idle(coordinator)
   end
@@ -935,6 +1109,79 @@ defmodule Sxf.Execution.CoordinatorTest do
     assert attempt_id == original.attempt.id
     assert {:ok, [%{outcome: :runtime_timeout}]} = Coordinator.await_idle(second)
     refute Process.alive?(resumed_worker)
+  end
+
+  test "restart loads the frozen claim after a newer processed source observation" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 20_000})
+    original = claim_with_session(fixture, "frozen-after-newer-source")
+
+    assert {:ok, %{task: same_task}} =
+             Tasks.normalize_external_issue(%{
+               provider: fixture.repository.provider,
+               repository_external_id: fixture.repository.external_id,
+               issue_external_id: fixture.task.source_ref,
+               source_version: "2026-07-20T20:00:02Z",
+               payload_sha256: String.duplicate("c", 64),
+               title: "Newer source observation",
+               body: "This version must not invalidate an already-frozen execution claim.",
+               actor_id: fixture.system_actor.id,
+               received_at: DateTime.add(base_time(), 2, :second),
+               correlation_id: uuid(),
+               metadata: %{}
+             })
+
+    assert same_task.id == fixture.task.id
+
+    {coordinator, supervisor} =
+      start_coordinator(fixture,
+        inspect: :running,
+        resume_scenario: :hanging,
+        notify: self(),
+        reconcile_on_start: true
+      )
+
+    assert Coordinator.active_count(coordinator) == 1
+    assert_receive {:agent_resumed, resumed_worker}
+
+    [entry] = :sys.get_state(coordinator).active |> Map.values()
+    assert entry.claim.attempt.id == original.attempt.id
+    assert entry.claim.lease.id == original.lease.id
+    assert entry.claim.preparation.id == fixture.preparation.id
+    assert entry.claim.preparation_contract == original.preparation_contract
+    assert entry.claim.preparation_fingerprint == original.preparation_fingerprint
+
+    assert Repo.aggregate(TaskAttempt, :count) == 1
+    assert Repo.aggregate(WorkerLease, :count) == 1
+
+    assert Repo.aggregate(
+             from(attempt in TaskAttempt,
+               where: attempt.task_id == ^fixture.task.id and attempt.status == "running"
+             ),
+             :count
+           ) == 1
+
+    assert Repo.aggregate(
+             from(lease in WorkerLease,
+               where: lease.task_id == ^fixture.task.id and lease.status == "active"
+             ),
+             :count
+           ) == 1
+
+    assert Repo.get!(DomainTask, fixture.task.id).state == "IMPLEMENTING"
+    assert Repo.get!(TaskAttempt, original.attempt.id).status == "running"
+    assert Repo.get!(WorkerLease, original.lease.id).status == "active"
+
+    refute Repo.exists?(
+             from(event in ExecutionEvent,
+               where:
+                 event.task_id == ^fixture.task.id and
+                   event.kind in ["completed", "failed", "timed_out", "cancelled"]
+             )
+           )
+
+    assert Process.alive?(resumed_worker)
+    stop_coordinator(coordinator, supervisor)
   end
 
   test "unsupported and failed resume become one explicit interrupted retry" do
@@ -1234,11 +1481,8 @@ defmodule Sxf.Execution.CoordinatorTest do
   end
 
   defp ready_fixture do
-    fixture = domain_fixture()
-    {:ok, %{task: task}} = transition(fixture.task, fixture.system_actor, "SPECIFIED", 1)
-    {:ok, %{task: task}} = transition(task, fixture.system_actor, "PLANNED", 2)
-    {:ok, %{task: task}} = transition(task, fixture.system_actor, "READY", 3)
-    %{fixture | task: task}
+    domain_fixture()
+    |> execution_preparation_fixture()
   end
 
   defp claim_attrs(fixture, suffix, occurred_at \\ @execution_time) do

@@ -7,7 +7,9 @@ defmodule Sxf.TestFixtures do
   alias Sxf.Tasks.EvidenceReference
   alias Sxf.Tasks.Project
   alias Sxf.Tasks.RepositoryRegistration
+  alias Sxf.Tasks.TaskPreparation
   alias Sxf.Tasks.TaskAttempt
+  alias Sxf.Tasks.TransitionEvent
   alias Sxf.Tasks.WorkerLease
 
   @base_time ~U[2026-07-20 20:00:00.000000Z]
@@ -106,9 +108,158 @@ defmodule Sxf.TestFixtures do
       max_provider_retries: 3
     }
 
-    %Budget{}
-    |> Budget.changeset(Map.merge(defaults, attrs))
-    |> Repo.insert!()
+    case Repo.get_by(TaskPreparation, task_id: task.id) do
+      nil ->
+        %Budget{}
+        |> Budget.changeset(Map.merge(defaults, attrs))
+        |> Repo.insert!()
+
+      preparation ->
+        budget =
+          Repo.get_by!(Budget,
+            task_id: task.id,
+            idempotency_key: "preparation:#{preparation.id}:budget"
+          )
+
+        updates =
+          defaults
+          |> Map.drop([:id, :task_id, :idempotency_key])
+          |> Map.merge(attrs)
+
+        budget =
+          budget
+          |> Budget.changeset(updates)
+          |> Repo.update!()
+
+        contract =
+          put_in(preparation.contract, ["budgets"], %{
+            "maxCostMicrousd" => budget.max_cost_microusd,
+            "maxRuntimeMs" => budget.max_runtime_ms,
+            "maxAgentTurns" => budget.max_agent_turns,
+            "maxRepairCycles" => budget.max_repair_cycles,
+            "maxProviderRetries" => budget.max_provider_retries
+          })
+
+        semantic_fingerprint = preparation_semantic_fingerprint(preparation, contract)
+
+        preparation
+        |> Ecto.Changeset.change(
+          contract: contract,
+          semantic_fingerprint: semantic_fingerprint
+        )
+        |> Repo.update!()
+
+        for state <- ~w(specified planned ready) do
+          event =
+            Repo.get_by!(TransitionEvent,
+              task_id: task.id,
+              idempotency_key: "preparation:#{preparation.id}:#{state}"
+            )
+
+          event
+          |> Ecto.Changeset.change(
+            metadata: Map.put(event.metadata, "semantic_fingerprint", semantic_fingerprint)
+          )
+          |> Repo.update!()
+        end
+
+        budget
+    end
+  end
+
+  def preparation_semantic_fingerprint(preparation, contract) do
+    :crypto.hash(
+      :sha256,
+      :erlang.term_to_binary(
+        %{
+          command: :prepare_task,
+          task_id: preparation.task_id,
+          project_id: preparation.project_id,
+          repository_registration_id: preparation.repository_registration_id,
+          registration_fingerprint: preparation.registration_fingerprint,
+          source_inbox_id: preparation.source_inbox_id,
+          source_version: preparation.source_version,
+          source_payload_sha256: preparation.source_payload_sha256,
+          actor_id: preparation.prepared_by_actor_id,
+          contract: contract
+        },
+        [:deterministic]
+      )
+    )
+    |> Base.encode16(case: :lower)
+  end
+
+  def execution_preparation_fixture(fixture) do
+    registration_fingerprint =
+      :crypto.hash(:sha256, "execution-registration:#{fixture.repository.id}")
+      |> Base.encode16(case: :lower)
+
+    manifest = %{
+      "schemaVersion" => "0.1",
+      "commands" => %{"install" => "fixture install", "test" => "fixture test"},
+      "autonomy" => %{
+        "createBranches" => true,
+        "openPullRequests" => true,
+        "mergeToDefault" => false,
+        "deployToProduction" => false
+      },
+      "verification" => %{
+        "independent" => true,
+        "requireDeterministicChecks" => true
+      },
+      "budgets" => %{
+        "maxCostMicrousd" => 2_000_000,
+        "maxRuntimeMinutes" => 15,
+        "maxAgentTurns" => 20,
+        "maxRepairCycles" => 0
+      },
+      "restrictions" => %{"allowedNetworkDomains" => []}
+    }
+
+    repository =
+      fixture.repository
+      |> RepositoryRegistration.registration_changeset(%{
+        manifest_schema_version: "0.1",
+        normalized_manifest: manifest,
+        raw_manifest_sha256: String.duplicate("a", 64),
+        registration_fingerprint: registration_fingerprint,
+        registered_by_actor_id: fixture.system_actor.id,
+        registered_at: DateTime.add(@base_time, -1, :second),
+        registration_correlation_id: uuid()
+      })
+      |> Repo.update!()
+
+    {:ok, intake} =
+      Tasks.normalize_external_issue(%{
+        provider: repository.provider,
+        repository_external_id: repository.external_id,
+        issue_external_id: fixture.task.source_ref,
+        source_version: DateTime.to_iso8601(@base_time),
+        payload_sha256: String.duplicate("b", 64),
+        title: fixture.task.title,
+        body: "Execution fixture request",
+        actor_id: fixture.system_actor.id,
+        received_at: @base_time,
+        correlation_id: uuid(),
+        metadata: %{}
+      })
+
+    {:ok, prepared} =
+      Sxf.TaskPreparation.prepare(%{
+        task_id: fixture.task.id,
+        actor_id: fixture.system_actor.id,
+        prepared_at: DateTime.add(@base_time, 1, :second),
+        correlation_id: uuid(),
+        idempotency_key: "fixture-preparation:#{fixture.task.id}"
+      })
+
+    Map.merge(fixture, %{
+      repository: repository,
+      task: prepared.task,
+      inbox: intake.inbox,
+      preparation: prepared.preparation,
+      preparation_budget: prepared.budget
+    })
   end
 
   def lease_fixture(task, attempt, attrs \\ %{}) do

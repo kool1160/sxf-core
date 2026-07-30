@@ -83,6 +83,9 @@ defmodule Sxf.ExecutionFakes.Agent do
   def start(context, emit) do
     if pid = context.options[:notify], do: send(pid, {:agent_started, self()})
 
+    if pid = context.options[:capture_context],
+      do: send(pid, {:agent_context, context})
+
     case context.options[:scenario] || :success do
       :unavailable ->
         {:error, :unavailable}
