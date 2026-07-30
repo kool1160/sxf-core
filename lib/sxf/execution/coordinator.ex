@@ -28,7 +28,7 @@ defmodule Sxf.Execution.Coordinator do
 
   use GenServer
 
-  alias Sxf.Execution.{Context, Event, Result}
+  alias Sxf.Execution.{Claim, Context, Event, Result}
 
   defstruct [
     :task_store,
@@ -716,10 +716,23 @@ defmodule Sxf.Execution.Coordinator do
 
     {actions, state} =
       state.task_store.active_claims(state.worker_id)
-      |> Enum.reject(&Map.has_key?(state.active, &1.lease.id))
-      |> Enum.reduce({[], state}, fn claim, {actions, state} ->
-        {action, state} = reconcile_claim(state, claim, correlation_id)
-        {[action | actions], state}
+      |> Enum.reject(&Map.has_key?(state.active, active_claim_lease_id(&1)))
+      |> Enum.reduce({[], state}, fn
+        %Claim{} = claim, {actions, state} ->
+          {action, state} = reconcile_claim(state, claim, correlation_id)
+          {[action | actions], state}
+
+        {:error, %Claim{} = recovery_claim, reason}, {actions, state} ->
+          {action, state} =
+            interrupt_unloadable_claim(
+              state,
+              recovery_claim,
+              reason,
+              correlation_id,
+              observed_at
+            )
+
+          {[action | actions], state}
       end)
 
     report =
@@ -737,6 +750,27 @@ defmodule Sxf.Execution.Coordinator do
       |> Map.update!(:errors, &Enum.reverse/1)
 
     {report, reschedule_control_timer(state)}
+  end
+
+  defp active_claim_lease_id(%Claim{} = claim), do: claim.lease.id
+  defp active_claim_lease_id({:error, %Claim{} = claim, _reason}), do: claim.lease.id
+
+  defp interrupt_unloadable_claim(state, claim, reason, correlation_id, observed_at) do
+    attrs = %{
+      actor_id: state.actor_id,
+      occurred_at: observed_at,
+      correlation_id: correlation_id,
+      idempotency_key: "restart-unloadable:#{claim.lease.id}:finish",
+      reason: "frozen preparation contract could not be loaded: #{inspect(reason)}"
+    }
+
+    case state.task_store.interrupt(claim, attrs) do
+      {:ok, result} ->
+        {{:interrupted, %{claim: claim, reason: reason, result: result}}, state}
+
+      {:error, interrupt_reason} ->
+        {{:error, %{claim: claim, reason: interrupt_reason}}, state}
+    end
   end
 
   defp reconcile_claim(state, claim, correlation_id) do

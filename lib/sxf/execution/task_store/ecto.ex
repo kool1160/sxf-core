@@ -133,7 +133,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
         Repo.rollback(:stale_backend_event)
       end
 
-      load_claim(lease)
+      load_claim_or_rollback(lease)
     end)
     |> flatten()
   end
@@ -188,7 +188,12 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     |> where([lease], lease.worker_id == ^worker_id and lease.status == "active")
     |> order_by([lease], asc: lease.acquired_at, asc: lease.id)
     |> Repo.all()
-    |> Enum.map(&load_claim/1)
+    |> Enum.map(fn lease ->
+      case load_claim(lease) do
+        {:ok, claim} -> claim
+        {:error, recovery_claim, reason} -> {:error, recovery_claim, reason}
+      end
+    end)
   end
 
   @impl true
@@ -297,6 +302,25 @@ defmodule Sxf.Execution.TaskStore.Ecto do
   end
 
   defp preparation_authority(task, require_active_budget?) do
+    with {:ok, authority} <- frozen_preparation_authority(task, require_active_budget?),
+         %RepositoryRegistration{} = registration <-
+           Repo.get(
+             RepositoryRegistration,
+             authority.preparation.repository_registration_id
+           ),
+         true <- registration.project_id == task.project_id,
+         true <- registration.id == task.repository_registration_id,
+         true <-
+           registration.registration_fingerprint ==
+             authority.preparation.registration_fingerprint,
+         false <- newer_processed_source_observation?(authority.preparation) do
+      {:ok, authority}
+    else
+      _ -> {:error, :task_preparation_authority_invalid}
+    end
+  end
+
+  defp frozen_preparation_authority(task, require_active_budget?) do
     preparations =
       Repo.all(
         from preparation in TaskPreparation,
@@ -306,12 +330,6 @@ defmodule Sxf.Execution.TaskStore.Ecto do
 
     with [preparation] <- preparations,
          true <- complete_preparation?(task, preparation),
-         %RepositoryRegistration{} = registration <-
-           Repo.get(RepositoryRegistration, preparation.repository_registration_id),
-         true <- registration.project_id == task.project_id,
-         true <- registration.id == task.repository_registration_id,
-         true <- registration.registration_fingerprint == preparation.registration_fingerprint,
-         false <- newer_processed_source_observation?(preparation),
          {:ok, budget} <-
            preparation_budget(task.id, preparation, require_active_budget?) do
       {:ok, %{preparation: preparation, budget: budget}}
@@ -320,10 +338,10 @@ defmodule Sxf.Execution.TaskStore.Ecto do
     end
   end
 
-  defp load_preparation_authority!(task) do
-    case preparation_authority(task, false) do
-      {:ok, authority} -> authority
-      {:error, reason} -> Repo.rollback(reason)
+  defp load_claim_or_rollback(lease) do
+    case load_claim(lease) do
+      {:ok, claim} -> claim
+      {:error, _recovery_claim, reason} -> Repo.rollback(reason)
     end
   end
 
@@ -545,7 +563,7 @@ defmodule Sxf.Execution.TaskStore.Ecto do
   end
 
   defp replay_claim(lease, attrs) do
-    claim = load_claim(lease)
+    claim = load_claim_or_rollback(lease)
     request_fingerprint = claim_request_fingerprint(attrs, claim.preparation_fingerprint)
 
     if lease.request_fingerprint == request_fingerprint do
@@ -564,17 +582,26 @@ defmodule Sxf.Execution.TaskStore.Ecto do
   defp load_claim(lease) do
     attempt = Repo.get!(TaskAttempt, lease.attempt_id)
     task = Repo.get!(Task, lease.task_id)
-    authority = load_preparation_authority!(task)
     budgets = budgets_for(lease.task_id, attempt.id)
 
+    case frozen_preparation_authority(task, false) do
+      {:ok, authority} ->
+        {:ok, build_loaded_claim(task, attempt, lease, budgets, authority.preparation)}
+
+      {:error, reason} ->
+        {:error, build_loaded_claim(task, attempt, lease, budgets, nil), reason}
+    end
+  end
+
+  defp build_loaded_claim(task, attempt, lease, budgets, preparation) do
     %Claim{
       task: task,
       attempt: attempt,
       lease: lease,
       budgets: budgets,
-      preparation: authority.preparation,
-      preparation_contract: authority.preparation.contract,
-      preparation_fingerprint: authority.preparation.semantic_fingerprint,
+      preparation: preparation,
+      preparation_contract: preparation && preparation.contract,
+      preparation_fingerprint: preparation && preparation.semantic_fingerprint,
       runtime_deadline_at:
         attempt.runtime_deadline_at || initial_runtime_deadline(lease.task_id, attempt.started_at),
       renewal_sequence:

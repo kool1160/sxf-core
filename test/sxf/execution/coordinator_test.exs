@@ -1111,6 +1111,79 @@ defmodule Sxf.Execution.CoordinatorTest do
     refute Process.alive?(resumed_worker)
   end
 
+  test "restart loads the frozen claim after a newer processed source observation" do
+    fixture = ready_fixture()
+    budget_fixture(fixture.task, %{max_runtime_ms: 20_000})
+    original = claim_with_session(fixture, "frozen-after-newer-source")
+
+    assert {:ok, %{task: same_task}} =
+             Tasks.normalize_external_issue(%{
+               provider: fixture.repository.provider,
+               repository_external_id: fixture.repository.external_id,
+               issue_external_id: fixture.task.source_ref,
+               source_version: "2026-07-20T20:00:02Z",
+               payload_sha256: String.duplicate("c", 64),
+               title: "Newer source observation",
+               body: "This version must not invalidate an already-frozen execution claim.",
+               actor_id: fixture.system_actor.id,
+               received_at: DateTime.add(base_time(), 2, :second),
+               correlation_id: uuid(),
+               metadata: %{}
+             })
+
+    assert same_task.id == fixture.task.id
+
+    {coordinator, supervisor} =
+      start_coordinator(fixture,
+        inspect: :running,
+        resume_scenario: :hanging,
+        notify: self(),
+        reconcile_on_start: true
+      )
+
+    assert Coordinator.active_count(coordinator) == 1
+    assert_receive {:agent_resumed, resumed_worker}
+
+    [entry] = :sys.get_state(coordinator).active |> Map.values()
+    assert entry.claim.attempt.id == original.attempt.id
+    assert entry.claim.lease.id == original.lease.id
+    assert entry.claim.preparation.id == fixture.preparation.id
+    assert entry.claim.preparation_contract == original.preparation_contract
+    assert entry.claim.preparation_fingerprint == original.preparation_fingerprint
+
+    assert Repo.aggregate(TaskAttempt, :count) == 1
+    assert Repo.aggregate(WorkerLease, :count) == 1
+
+    assert Repo.aggregate(
+             from(attempt in TaskAttempt,
+               where: attempt.task_id == ^fixture.task.id and attempt.status == "running"
+             ),
+             :count
+           ) == 1
+
+    assert Repo.aggregate(
+             from(lease in WorkerLease,
+               where: lease.task_id == ^fixture.task.id and lease.status == "active"
+             ),
+             :count
+           ) == 1
+
+    assert Repo.get!(DomainTask, fixture.task.id).state == "IMPLEMENTING"
+    assert Repo.get!(TaskAttempt, original.attempt.id).status == "running"
+    assert Repo.get!(WorkerLease, original.lease.id).status == "active"
+
+    refute Repo.exists?(
+             from(event in ExecutionEvent,
+               where:
+                 event.task_id == ^fixture.task.id and
+                   event.kind in ["completed", "failed", "timed_out", "cancelled"]
+             )
+           )
+
+    assert Process.alive?(resumed_worker)
+    stop_coordinator(coordinator, supervisor)
+  end
+
   test "unsupported and failed resume become one explicit interrupted retry" do
     for {suffix, agent_backend, resume_scenario} <- [
           {"unsupported", AgentWithoutResume, :hanging},

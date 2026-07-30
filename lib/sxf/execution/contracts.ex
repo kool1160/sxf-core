@@ -126,7 +126,8 @@ defmodule Sxf.Execution.TaskStore do
   @callback record_event(Claim.t(), Event.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback enforce_runtime_timeout(Claim.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback finish(Claim.t(), atom(), map()) :: {:ok, map()} | {:error, term()}
-  @callback active_claims(String.t()) :: [Claim.t()]
+  @callback active_claims(String.t()) ::
+              [Claim.t() | {:error, Claim.t(), :task_preparation_authority_invalid}]
   @callback interrupt(Claim.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback reconcile_expired(DateTime.t(), Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
               [map()]
