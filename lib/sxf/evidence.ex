@@ -353,6 +353,10 @@ defmodule Sxf.Evidence do
     fingerprint =
       request_fingerprint(attrs, staged.sha256, staged.byte_size)
 
+    transact_persist(attrs, staged, fingerprint, 1)
+  end
+
+  defp transact_persist(attrs, staged, fingerprint, lock_retries_remaining) do
     case Repo.transaction(fn ->
            validate_ownership_in_transaction!(attrs)
 
@@ -405,7 +409,12 @@ defmodule Sxf.Evidence do
       {:error, reason} -> database_error(reason)
     end
   rescue
-    error in Exqlite.Error -> database_error(error.message)
+    exception in [DBConnection.ConnectionError, Exqlite.Error] ->
+      if lock_retries_remaining > 0 and database_locked?(exception) do
+        transact_persist(attrs, staged, fingerprint, lock_retries_remaining - 1)
+      else
+        database_error(Exception.message(exception))
+      end
   end
 
   defp validate_ownership_in_transaction!(attrs) do
@@ -727,6 +736,15 @@ defmodule Sxf.Evidence do
 
   defp unwrap_or_rollback({:ok, value}), do: value
   defp unwrap_or_rollback({:error, changeset}), do: Repo.rollback(changeset)
+
+  defp database_locked?(exception) do
+    exception
+    |> Exception.message()
+    |> then(
+      &(String.contains?(&1, "database is locked") or
+          String.contains?(&1, "database table is locked"))
+    )
+  end
 
   defp database_error(_reason),
     do: error(:database_failure, "evidence reference could not be persisted")
