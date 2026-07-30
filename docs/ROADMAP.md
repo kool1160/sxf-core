@@ -21,6 +21,9 @@ The roadmap is organized around working vertical slices. SXF should prove one re
   authentication and issue-polling adapter without recurring operation or repository mutation.
   Child [Issue #31](https://github.com/kool1160/sxf-core/issues/31) adds the durable
   manifest-gated preparation boundary from `DISCOVERED` to `READY` without execution.
+  Child [Issue #33](https://github.com/kool1160/sxf-core/issues/33) adds immutable
+  content-addressed evidence bytes and verified transition attachment without creating an evidence
+  producer or executing repository work.
 
 ## Phase 0 — Foundation
 
@@ -40,6 +43,8 @@ Goal: take one well-specified GitHub issue in a test repository from `READY` to 
   by [ADR 0005](decisions/0005-github-app-intake-and-local-hosting.md).
 - Atomic manifest-gated preparation using the accepted repository registration and exact M3
   budgets before a task becomes `READY`.
+- Immutable local content-addressed evidence storage with durable task/attempt attribution and
+  integrity-checked transition attachment.
 - One isolated workspace at a time.
 - One coding-agent backend.
 - Repository command execution.

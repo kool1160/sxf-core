@@ -4,7 +4,6 @@ defmodule Sxf.TestFixtures do
   alias Sxf.Tasks
   alias Sxf.Tasks.Actor
   alias Sxf.Tasks.Budget
-  alias Sxf.Tasks.EvidenceReference
   alias Sxf.Tasks.Project
   alias Sxf.Tasks.RepositoryRegistration
   alias Sxf.Tasks.TaskPreparation
@@ -287,16 +286,22 @@ defmodule Sxf.TestFixtures do
       task_id: task.id,
       producer_actor_id: actor.id,
       kind: kind,
-      storage_uri: "sha256://#{String.duplicate("a", 64)}/#{System.unique_integer([:positive])}",
-      sha256: String.duplicate("a", 64),
       media_type: "application/json",
-      byte_size: 42,
-      finalized_at: @base_time
+      finalized_at: @base_time,
+      correlation_id: uuid(),
+      idempotency_key: "evidence:#{System.unique_integer([:positive])}",
+      redacted: true
     }
 
-    %EvidenceReference{}
-    |> EvidenceReference.changeset(Map.merge(defaults, attrs))
-    |> Repo.insert!()
+    evidence_attrs = Map.merge(defaults, attrs)
+    bytes = Map.get(evidence_attrs, :bytes, Jason.encode!(%{kind: kind, task_id: task.id}))
+
+    {:ok, %{reference: reference}} =
+      evidence_attrs
+      |> Map.delete(:bytes)
+      |> Sxf.Evidence.put(bytes)
+
+    reference
   end
 
   def decision_fixture(task, actor, kind, attrs \\ %{}) do

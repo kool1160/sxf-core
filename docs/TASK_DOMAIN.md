@@ -22,10 +22,12 @@ Symphony execution semantics without starting its orchestrator:
 - atomic, provider-neutral external-issue inbox normalization plus outbox reference records that
   reserve the later external-action boundary; and
 - atomic manifest-gated preparation that pins accepted repository/source authority, creates one
-  task budget, and advances `DISCOVERED -> SPECIFIED -> PLANNED -> READY`.
+  task budget, and advances `DISCOVERED -> SPECIFIED -> PLANNED -> READY`; and
+- immutable local content-addressed evidence bytes whose verified durable references can be
+  attached transactionally to transitions.
 
 It deliberately activates no live tracker, recurring poll process, agent runtime, repository
-workspace, sandbox, evidence byte store, webhook processor, external-action dispatcher, or user
+workspace, sandbox, evidence producer, webhook processor, external-action dispatcher, or user
 interface. The one-shot GitHub poller and task-preparation command require explicit calls. The
 coordinator is tested only with deterministic boundary fakes. The quarantined upstream application
 is compiled for conformance only and is not a second workflow authority.
@@ -45,7 +47,7 @@ session IDs are opaque strings attached to stable SXF IDs; they never become pri
 | `task_preparations` | Immutable task-owned manifest/source contract and semantic fingerprint that authorized the first promotion to `READY`. |
 | `task_attempts` | Ordered, bounded execution/repair attempt with opaque backend/session references and the durable absolute runtime deadline. |
 | `task_transition_events` | Append-oriented prior/result state fact with a task-local sequence, actor, reason, time, correlation, idempotency key, request fingerprint, and any authorizing human-decision reference. |
-| `evidence_references` | Immutable evidence metadata: kind, content hash, storage URI, producer, task/attempt, size, and finalization time. |
+| `evidence_references` | Immutable evidence metadata: kind, content hash, canonical storage URI, producer, task/attempt, size, finalization time, redaction assertion, correlation, idempotency key, and semantic request fingerprint. |
 | `event_evidence_references` | Many-to-many attachment of finalized evidence to a transition. |
 | `budgets` | Exact integer task/attempt limits for cost, runtime, turns, repairs, and provider retries. |
 | `usage_entries` | Append-oriented, idempotent increments against one budget. |
@@ -230,13 +232,23 @@ therefore produce one preparation, budget, and transition sequence.
 
 ## Evidence rules
 
-The schema persists content hashes and references, not artifact bytes. `check_result` evidence is
-required to leave `CI_RUNNING`; `verification_result` evidence is required for a verification
-verdict. Referenced evidence must exist, belong to the same task, and be finalized. Associations are
-inserted in the transition transaction.
+SQLite persists immutable content hashes and references while `Sxf.Evidence` publishes bounded
+bytes to the configured local content-addressed root. The physical identity is derived from the
+bytes, and one content address may back multiple independently attributed task/attempt references.
+Exact command replay returns the original reference; changed bytes or attribution conflicts.
+Finalized reference updates and deletes are rejected.
 
-The content-addressed byte store, redaction/finalization implementation, retention, and backup are
-deferred. A workspace path, model message, or unfinalized output is not evidence.
+`check_result` evidence is required to leave `CI_RUNNING`; `verification_result` evidence is
+required for a verification verdict. Referenced evidence must exist, belong to the same task, be
+finalized, and pass current hash/size/regular-file verification. Associations are inserted in the
+transition transaction. Missing or corrupt bytes fail the transition atomically. A workspace path,
+model message, unfinalized output, or metadata-only claim is not evidence.
+
+The byte store is restart-independent and its audit reports verified, missing, corrupt, invalid, and
+orphan content. A filesystem publish followed by a database failure can leave an inert orphan
+because SQLite and the filesystem do not share one transaction; it is never adopted as evidence.
+Redaction by future producers, retention, coordinated backup/restore tooling, garbage collection,
+and remote storage remain deferred. See [`EVIDENCE_STORE.md`](EVIDENCE_STORE.md).
 
 ## Migration and versioning
 

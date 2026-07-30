@@ -58,8 +58,9 @@ Costs and risks:
 - append-only protection currently depends on the domain boundary rather than database triggers;
 - callers that use a human decision must allocate the target transition UUID before recording the
   decision, adding a small amount of command-protocol ceremony;
-- the local evidence byte store, inbox processor, and outbox dispatcher are still unimplemented;
-  and
+- the local content-addressed evidence byte store is implemented by
+  [Issue #33](https://github.com/kool1160/sxf-core/issues/33), while evidence retention,
+  coordinated backup, recurring inbox processing, and outbox delivery remain unimplemented; and
 - future state/edge changes require explicit migration and compatibility review.
 
 ## Alternatives considered
@@ -75,7 +76,7 @@ SXF's lifecycle, budgets, evidence, leases, or atomic external-action intent.
 ## Deferred work
 
 - Symphony scheduler integration and durable claim acquisition.
-- Content-addressed evidence-byte storage and retention.
+- Evidence retention, garbage collection, remote storage, and coordinated backup/restore.
 - GitHub webhook inbox processing and external-action outbox delivery.
 - Crash-injection at every future external-side-effect boundary.
 - PostgreSQL migration and distributed lease semantics.

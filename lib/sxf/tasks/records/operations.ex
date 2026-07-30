@@ -9,6 +9,10 @@ defmodule Sxf.Tasks.EvidenceReference do
     field :media_type, :string
     field :byte_size, :integer
     field :finalized_at, :utc_datetime_usec
+    field :correlation_id, Ecto.UUID
+    field :idempotency_key, :string
+    field :request_fingerprint, :string
+    field :redacted, :boolean, default: false
     field :metadata, :map, default: %{}
     belongs_to :task, Sxf.Tasks.Task
     belongs_to :attempt, Sxf.Tasks.TaskAttempt
@@ -29,15 +33,32 @@ defmodule Sxf.Tasks.EvidenceReference do
       :media_type,
       :byte_size,
       :finalized_at,
+      :correlation_id,
+      :idempotency_key,
+      :request_fingerprint,
+      :redacted,
       :metadata
     ])
-    |> validate_required([:task_id, :producer_actor_id, :kind, :storage_uri, :sha256])
+    |> validate_required([
+      :task_id,
+      :producer_actor_id,
+      :kind,
+      :storage_uri,
+      :sha256,
+      :byte_size,
+      :finalized_at,
+      :correlation_id,
+      :idempotency_key,
+      :request_fingerprint,
+      :redacted
+    ])
     |> validate_format(:sha256, ~r/\A[0-9a-f]{64}\z/)
+    |> validate_format(:request_fingerprint, ~r/\A[0-9a-f]{64}\z/)
     |> validate_number(:byte_size, greater_than_or_equal_to: 0)
     |> foreign_key_constraint(:task_id)
     |> foreign_key_constraint(:attempt_id)
     |> foreign_key_constraint(:producer_actor_id)
-    |> unique_constraint([:storage_uri, :sha256])
+    |> unique_constraint([:task_id, :idempotency_key])
   end
 end
 

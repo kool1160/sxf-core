@@ -73,9 +73,11 @@ preparation command now requires one unambiguous processed observation, pins the
 repository registration and ordered command plan, materializes the M3 task budget, and atomically
 advances `DISCOVERED` through `SPECIFIED` and `PLANNED` to `READY` without executing a manifest
 command. Invalid or ambiguous authority becomes a durable blocker, and coordinator claims load and
-revalidate only the frozen contract. It does not yet contain live operator
+revalidate only the frozen contract. An immutable local content-addressed evidence store now
+derives hashes and sizes from bounded bytes, persists task/attempt-attributed finalized references,
+and re-verifies content before reads, audits, or transition attachment. It does not yet contain live operator
 credentials/setup, a recurring poll loop, live agent, repository or container execution, container
-workspace runtime, or evidence byte store. The pinned Symphony Elixir
+workspace runtime, or evidence producers. The pinned Symphony Elixir
 foundation is retained under
 `upstream/openai-symphony` as a compile-time, default-denied path dependency; it is not started and
 does not replace SXF's durable task authority.
@@ -86,7 +88,8 @@ manifest validation contract, [`docs/UPSTREAM_SYMPHONY.md`](docs/UPSTREAM_SYMPHO
 upstream boundary, [`docs/EXECUTION_COORDINATOR.md`](docs/EXECUTION_COORDINATOR.md) for the M3
 coordinator contract, [`docs/GITHUB_ISSUE_INTAKE.md`](docs/GITHUB_ISSUE_INTAKE.md) for the bounded
 M3 App and polling boundary, [`docs/TASK_PREPARATION.md`](docs/TASK_PREPARATION.md) for the
-manifest-gated promotion boundary, and [`docs/`](docs/) for broader product, architecture,
+manifest-gated promotion boundary, [`docs/EVIDENCE_STORE.md`](docs/EVIDENCE_STORE.md) for the
+content-addressed byte boundary, and [`docs/`](docs/) for broader product, architecture,
 reliability, security, and roadmap documents.
 
 ## Durable-core checks
@@ -101,4 +104,4 @@ mix test
 ```
 
 `mix test` creates and migrates the ignored test database. Production requires an explicit
-`SXF_DATABASE_PATH`.
+`SXF_DATABASE_PATH` and `SXF_EVIDENCE_PATH`.

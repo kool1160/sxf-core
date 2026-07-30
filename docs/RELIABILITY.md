@@ -142,6 +142,19 @@ A successful task should include, as applicable:
 
 Missing required evidence means the task is not verified.
 
+`Sxf.Evidence` makes this evidence byte-addressable rather than metadata-only. It stages bounded
+bytes, derives their SHA-256 and size, publishes one non-overwriting local content address, and
+persists an immutable attributed reference with semantic idempotency. Exact bytes deduplicate
+physically; references retain task and attempt ownership. `get`, `verify`, `audit`, and task
+transition attachment re-hash the stored regular file. Missing or corrupt bytes cannot become a
+successful transition.
+
+The filesystem and SQLite cannot commit atomically. A crash after blob publication and before
+reference commit can create an inert orphan, never a trusted reference; deterministic audit reports
+it. Repo restart tests prove that reference and byte verification depend only on durable state.
+Retention, garbage collection, and coordinated database/evidence backup remain explicit deferred
+operations rather than implicit cleanup.
+
 ## Flaky checks
 
 A check may be retried only under a documented flake policy. Repeated success after failures must remain visible in evidence. SXF must not hide instability by rerunning until green.

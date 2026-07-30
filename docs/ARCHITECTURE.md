@@ -165,6 +165,14 @@ worker credentials remain external or deferred. See
 
 Stores structured results and references to logs, test output, screenshots, videos, traces, diffs, scan reports, and deployment observations. Evidence must be tied to a task attempt and immutable after finalization.
 
+The M3 `Sxf.Evidence` boundary now derives SHA-256, exact size, and a canonical `sha256://` identity
+from bounded bytes; publishes one immutable local content address; and atomically creates the
+task/attempt-attributed durable reference. Identical bytes deduplicate physically without merging
+their durable ownership. Reads, audits, and transition attachments re-hash the regular stored file,
+so metadata or a workspace path cannot satisfy an evidence gate. Finalized references cannot be
+updated or deleted. Filesystem/SQLite crash gaps may leave only an inert orphan blob, which audit
+reports without adopting or deleting it. See [`EVIDENCE_STORE.md`](EVIDENCE_STORE.md).
+
 ### Operator interface
 
 Shows projects, active tasks, state, budgets, failures, evidence, required decisions, and release readiness. The dashboard is an operational surface, not the source of workflow truth.
