@@ -87,9 +87,15 @@ defmodule Sxf.Tasks.ReviewRegressionsTest do
         attempt_id: foreign_attempt.id,
         producer_actor_id: first.system_actor.id,
         kind: "check_result",
-        storage_uri: "sha256://#{String.duplicate("b", 64)}/cross-task",
+        storage_uri: "sha256://#{String.duplicate("b", 64)}",
         sha256: String.duplicate("b", 64),
-        finalized_at: base_time()
+        media_type: "application/json",
+        byte_size: 1,
+        finalized_at: base_time(),
+        correlation_id: uuid(),
+        idempotency_key: "cross-task-evidence",
+        request_fingerprint: String.duplicate("c", 64),
+        redacted: true
       })
 
     assert_raise Ecto.ConstraintError, fn -> Repo.insert(evidence_changeset) end

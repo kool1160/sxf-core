@@ -41,6 +41,13 @@ durable inbox/task metadata, errors, and logs. Intake never falls back to a pers
 - Redact known secret patterns before persistence.
 - Production credentials must not be available to ordinary build workers.
 
+The local evidence store is control-plane data, not a worker-writable artifact directory. Workers
+must not receive its configured root or publish directly to a digest path. Evidence producers must
+redact prohibited secrets before calling `Sxf.Evidence.put/2`; the content store derives identity
+from the exact accepted bytes and does not silently transform them. GitHub App private keys,
+installation tokens, authorization headers, broad credentials, and production data remain
+prohibited evidence. See [`EVIDENCE_STORE.md`](EVIDENCE_STORE.md).
+
 ### Sandbox isolation
 
 Every task attempt runs in an isolated workspace with resource limits. Workers must not share writable filesystems, credentials, process namespaces, or unscoped caches.
@@ -102,6 +109,11 @@ The verifier must not inherit unnecessary builder credentials or writable access
 ## Audit
 
 Record actor identity, permissions, tool calls, policy decisions, state transitions, credential scope, and external mutations. Audit records must be append-only from the perspective of execution agents.
+
+Evidence references are immutable after finalization, and actual bytes are re-hashed before read or
+transition attachment. Content paths are derived only from lowercase SHA-256 values; file-source
+symlinks and non-regular stored objects are rejected. Audit reports missing, altered, invalid, and
+orphaned content without repairing, adopting, or deleting it.
 
 ## Security failure behavior
 

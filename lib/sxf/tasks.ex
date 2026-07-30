@@ -784,6 +784,11 @@ defmodule Sxf.Tasks do
       attempt_id && Enum.any?(evidence, &(&1.attempt_id not in [nil, attempt_id])) ->
         Repo.rollback(:evidence_attempt_mismatch)
 
+      Enum.any?(evidence, fn item ->
+        not match?({:ok, %{status: :verified}}, Sxf.Evidence.verify_reference(item))
+      end) ->
+        Repo.rollback(:evidence_integrity_failure)
+
       true ->
         evidence
     end

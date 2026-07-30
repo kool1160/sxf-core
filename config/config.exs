@@ -16,6 +16,10 @@ config :sxf_core, Sxf.Repo,
 # supplies approved backend modules. Imported Symphony is never supervised as a workflow owner.
 config :sxf_core, execution_coordinator_enabled: false
 
+config :sxf_core, :evidence_store,
+  root: Path.expand("../var/evidence", __DIR__),
+  max_bytes: 16 * 1024 * 1024
+
 # Imported Symphony is compile-time foundation code only. These defense-in-depth switches remain
 # false until a later SXF integration supplies durable authorization and a Linux-container worker.
 config :symphony_elixir,
