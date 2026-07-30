@@ -69,9 +69,11 @@ task with replay and concurrency protection. A one-shot local-control-plane GitH
 signs bounded RS256 App JWTs, mints a token scoped to the registered M3 repository, reads the
 complete bounded `sxf:ready` issue view through an injectable transport, and submits canonical
 observations to that durable command without scheduling or repository mutation. A manifest-gated
-preparation command now pins the latest processed observation and accepted repository registration,
-materializes the M3 task budget, and atomically advances `DISCOVERED` through `SPECIFIED` and
-`PLANNED` to `READY` without executing a manifest command. It does not yet contain live operator
+preparation command now requires one unambiguous processed observation, pins the accepted
+repository registration and ordered command plan, materializes the M3 task budget, and atomically
+advances `DISCOVERED` through `SPECIFIED` and `PLANNED` to `READY` without executing a manifest
+command. Invalid or ambiguous authority becomes a durable blocker, and coordinator claims load and
+revalidate only the frozen contract. It does not yet contain live operator
 credentials/setup, a recurring poll loop, live agent, repository or container execution, container
 workspace runtime, or evidence byte store. The pinned Symphony Elixir
 foundation is retained under

@@ -1,12 +1,23 @@
 defmodule Sxf.Execution.Claim do
   @moduledoc "A durable, fenced execution claim loaded from the task ledger."
 
-  @enforce_keys [:task, :attempt, :lease, :budgets]
+  @enforce_keys [
+    :task,
+    :attempt,
+    :lease,
+    :budgets,
+    :preparation,
+    :preparation_contract,
+    :preparation_fingerprint
+  ]
   defstruct [
     :task,
     :attempt,
     :lease,
     :budgets,
+    :preparation,
+    :preparation_contract,
+    :preparation_fingerprint,
     :runtime_deadline_at,
     renewal_sequence: 0,
     replayed?: false
@@ -17,6 +28,9 @@ defmodule Sxf.Execution.Claim do
           attempt: term(),
           lease: term(),
           budgets: [term()],
+          preparation: term(),
+          preparation_contract: map(),
+          preparation_fingerprint: String.t(),
           runtime_deadline_at: DateTime.t() | nil,
           renewal_sequence: non_neg_integer(),
           replayed?: boolean()
@@ -26,14 +40,36 @@ end
 defmodule Sxf.Execution.Context do
   @moduledoc "Provider-neutral input passed across execution boundaries."
 
-  @enforce_keys [:claim, :actor_id, :correlation_id, :started_at]
-  defstruct [:claim, :actor_id, :correlation_id, :started_at, :workspace, :sandbox, options: %{}]
+  @enforce_keys [
+    :claim,
+    :actor_id,
+    :correlation_id,
+    :started_at,
+    :preparation,
+    :preparation_contract,
+    :preparation_fingerprint
+  ]
+  defstruct [
+    :claim,
+    :actor_id,
+    :correlation_id,
+    :started_at,
+    :preparation,
+    :preparation_contract,
+    :preparation_fingerprint,
+    :workspace,
+    :sandbox,
+    options: %{}
+  ]
 
   @type t :: %__MODULE__{
           claim: Sxf.Execution.Claim.t(),
           actor_id: Ecto.UUID.t(),
           correlation_id: Ecto.UUID.t(),
           started_at: DateTime.t(),
+          preparation: term(),
+          preparation_contract: map(),
+          preparation_fingerprint: String.t(),
           workspace: term(),
           sandbox: term(),
           options: map()

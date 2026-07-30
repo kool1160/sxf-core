@@ -64,6 +64,12 @@ defmodule Sxf.TaskPreparationTest do
     contract = result.preparation.contract
     assert contract["commands"]["install"] == "write-file #{sentinel}"
     assert contract["commands"]["test"] == "mix test"
+
+    assert contract["commandPlan"] == [
+             %{"name" => "install", "command" => "write-file #{sentinel}"},
+             %{"name" => "test", "command" => "mix test"}
+           ]
+
     assert contract["task"]["title"] == "Prepare the M3 slice"
     assert contract["task"]["body"] == "Implement only the bounded task."
     assert contract["task"]["source"]["issueExternalId"] == context.task.source_ref
@@ -86,6 +92,30 @@ defmodule Sxf.TaskPreparationTest do
 
     snapshot = Tasks.restart_snapshot(DateTime.add(@prepare_time, 1, :second))
     assert Enum.map(snapshot.tasks, & &1.id) == [context.task.id]
+  end
+
+  test "persists every accepted command in deterministic execution order", fixture do
+    context =
+      prepared_fixture(fixture,
+        command_overrides: %{
+          "lint" => "mix format --check-formatted",
+          "typecheck" => "mix dialyzer",
+          "integrationTest" => "mix test --only integration",
+          "build" => "mix compile",
+          "start" => "mix run --no-halt"
+        }
+      )
+
+    assert {:ok, result} = TaskPreparation.prepare(preparation_attrs(context))
+
+    assert result.preparation.contract["commandPlan"] == [
+             %{"name" => "install", "command" => "mix deps.get"},
+             %{"name" => "lint", "command" => "mix format --check-formatted"},
+             %{"name" => "typecheck", "command" => "mix dialyzer"},
+             %{"name" => "test", "command" => "mix test"},
+             %{"name" => "integrationTest", "command" => "mix test --only integration"},
+             %{"name" => "build", "command" => "mix compile"}
+           ]
   end
 
   test "exact semantic replay ignores fresh envelope values and returns durable lookup",
@@ -116,7 +146,8 @@ defmodule Sxf.TaskPreparationTest do
     assert lookup.preparation.contract == first.preparation.contract
   end
 
-  test "preparation pins the latest processed source observation", fixture do
+  test "multiple processed source versions block for operator input before preparation",
+       fixture do
     context = prepared_fixture(fixture)
 
     later_attrs =
@@ -133,13 +164,35 @@ defmodule Sxf.TaskPreparationTest do
     assert {:ok, %{inbox: latest, task: task}} = Tasks.normalize_external_issue(later_attrs)
     assert task.id == context.task.id
 
-    assert {:ok, result} =
+    assert {:error, :multiple_processed_source_versions} =
              TaskPreparation.prepare(preparation_attrs(%{context | task: task, inbox: latest}))
 
-    assert result.preparation.source_inbox_id == latest.id
-    assert result.preparation.source_version == later_attrs.source_version
-    assert result.preparation.contract["task"]["title"] == "Latest issue title"
-    assert result.preparation.contract["task"]["body"] == "Latest issue body"
+    blocked = Repo.get!(Task, task.id)
+    assert blocked.state == "BLOCKED"
+    assert blocked.resume_state == "DISCOVERED"
+
+    assert %Blocker{
+             kind: "operator_input",
+             status: "active",
+             resume_state: "DISCOVERED",
+             metadata: %{
+               "preparation_failure" => "multiple_processed_source_versions",
+               "source_versions" => source_versions
+             }
+           } = Repo.get_by!(Blocker, task_id: task.id)
+
+    assert source_versions == [
+             "2026-07-30T12:00:00Z",
+             "2026-07-30T12:00:30Z"
+           ]
+
+    assert Tasks.task_history(task.id) |> Enum.map(&{&1.prior_state, &1.resulting_state}) == [
+             {nil, "DISCOVERED"},
+             {"DISCOVERED", "BLOCKED"}
+           ]
+
+    refute Repo.get_by(TaskPreparationRecord, task_id: task.id)
+    refute Repo.get_by(Budget, task_id: task.id)
   end
 
   test "lower manifest budgets remain exact rather than being raised to M3 ceilings", fixture do
@@ -189,7 +242,7 @@ defmodule Sxf.TaskPreparationTest do
     assert Repo.aggregate(TransitionEvent, :count) == 4
   end
 
-  test "missing M3 autonomy and budgets outside M3 ceilings fail without partial promotion",
+  test "invalid manifest authority creates policy blockers without partial promotion",
        fixture do
     missing_autonomy =
       prepared_fixture(fixture,
@@ -221,12 +274,58 @@ defmodule Sxf.TaskPreparationTest do
              TaskPreparation.prepare(preparation_attrs(over_budget))
 
     for context <- [missing_autonomy, over_budget] do
-      assert Repo.get!(Task, context.task.id).state == "DISCOVERED"
+      assert Repo.get!(Task, context.task.id).state == "BLOCKED"
 
-      assert Tasks.task_history(context.task.id) |> Enum.map(& &1.resulting_state) == [
-               "DISCOVERED"
-             ]
+      assert Tasks.task_history(context.task.id) |> Enum.map(& &1.resulting_state) ==
+               ~w(DISCOVERED BLOCKED)
 
+      refute Repo.get_by(TaskPreparationRecord, task_id: context.task.id)
+      refute Repo.get_by(Budget, task_id: context.task.id)
+
+      assert %Blocker{kind: "policy", status: "active"} =
+               Repo.get_by!(Blocker, task_id: context.task.id)
+    end
+  end
+
+  test "M3 rejects merge and production-deployment authority even if registration contains it",
+       fixture do
+    merge =
+      prepared_fixture(fixture,
+        external_id: "R_merge_#{System.unique_integer([:positive])}",
+        manifest_overrides: %{"mergeToDefault" => true},
+        policy_overrides: [
+          allowed_autonomy: ["createBranches", "openPullRequests", "mergeToDefault"]
+        ]
+      )
+
+    assert {:error, :merge_to_default_not_authorized} =
+             TaskPreparation.prepare(preparation_attrs(merge))
+
+    production =
+      prepared_fixture(fixture,
+        external_id: "R_production_#{System.unique_integer([:positive])}"
+      )
+
+    repository =
+      production.repository
+      |> Ecto.Changeset.change(
+        normalized_manifest:
+          put_in(
+            production.repository.normalized_manifest,
+            ["autonomy", "deployToProduction"],
+            true
+          )
+      )
+      |> Repo.update!()
+
+    production = %{production | repository: repository}
+
+    assert {:error, :production_deployment_not_authorized} =
+             TaskPreparation.prepare(preparation_attrs(production))
+
+    for context <- [merge, production] do
+      assert Repo.get!(Task, context.task.id).state == "BLOCKED"
+      assert %Blocker{kind: "policy"} = Repo.get_by!(Blocker, task_id: context.task.id)
       refute Repo.get_by(TaskPreparationRecord, task_id: context.task.id)
       refute Repo.get_by(Budget, task_id: context.task.id)
     end
@@ -298,7 +397,8 @@ defmodule Sxf.TaskPreparationTest do
     assert {:error, :registration_incomplete} =
              TaskPreparation.prepare(preparation_attrs(context))
 
-    assert Repo.get!(Task, task.id).state == "DISCOVERED"
+    assert Repo.get!(Task, task.id).state == "BLOCKED"
+    assert %Blocker{kind: "policy"} = Repo.get_by!(Blocker, task_id: task.id)
     assert Repo.aggregate(TaskPreparationRecord, :count) == 0
     assert Repo.aggregate(Budget, :count) == 0
   end
@@ -364,6 +464,7 @@ defmodule Sxf.TaskPreparationTest do
     manifest =
       manifest_map(
         Keyword.get(opts, :install_command, "mix deps.get"),
+        Keyword.get(opts, :command_overrides, %{}),
         Keyword.get(opts, :manifest_overrides, %{}),
         Keyword.get(opts, :budget_overrides, %{})
       )
@@ -406,7 +507,7 @@ defmodule Sxf.TaskPreparationTest do
     })
   end
 
-  defp manifest_map(install_command, autonomy_overrides, budget_overrides) do
+  defp manifest_map(install_command, command_overrides, autonomy_overrides, budget_overrides) do
     %{
       "schemaVersion" => "0.1",
       "project" => %{
@@ -414,10 +515,14 @@ defmodule Sxf.TaskPreparationTest do
         "description" => "Synthetic M3 repository",
         "status" => "existing"
       },
-      "commands" => %{
-        "install" => install_command,
-        "test" => "mix test"
-      },
+      "commands" =>
+        Map.merge(
+          %{
+            "install" => install_command,
+            "test" => "mix test"
+          },
+          command_overrides
+        ),
       "autonomy" =>
         Map.merge(
           %{

@@ -11,6 +11,7 @@ defmodule Sxf.TaskPreparation do
   import Ecto.Query
 
   alias Sxf.Repo
+  alias Sxf.Tasks
   alias Sxf.Tasks.Actor
   alias Sxf.Tasks.Budget
   alias Sxf.Tasks.ExternalEventInboxReference
@@ -68,29 +69,63 @@ defmodule Sxf.TaskPreparation do
         Repo.rollback(:repository_registration_not_found)
 
     validate_registration_ownership(task, registration)
-    manifest = validate_manifest_registration(registration)
-    source = latest_source_observation(task, registration)
-    contract = build_contract(task, registration, source, manifest)
-    semantic_fingerprint = semantic_fingerprint(task, registration, source, actor, contract)
 
     case Repo.get_by(Preparation, task_id: task.id) do
-      %Preparation{semantic_fingerprint: ^semantic_fingerprint} = preparation ->
-        preparation_result(preparation, true) |> unwrap_or_rollback()
-
-      %Preparation{} ->
-        Repo.rollback(:preparation_conflict)
-
       nil ->
-        create_preparation(
-          task,
-          registration,
-          source,
-          actor,
-          manifest,
-          contract,
-          semantic_fingerprint,
-          attrs
-        )
+        prepare_unprepared_task(task, registration, actor, attrs)
+
+      %Preparation{} = preparation ->
+        replay_preparation(preparation, task, registration, actor)
+    end
+  end
+
+  defp prepare_unprepared_task(task, registration, actor, attrs) do
+    if task.state != "DISCOVERED" do
+      Repo.rollback(:task_not_discovered)
+    end
+
+    with {:ok, source} <- source_observation(task, registration),
+         {:ok, manifest} <- validate_manifest_registration(registration) do
+      contract = build_contract(task, registration, source, manifest)
+      semantic_fingerprint = semantic_fingerprint(task, registration, source, actor, contract)
+
+      create_preparation(
+        task,
+        registration,
+        source,
+        actor,
+        manifest,
+        contract,
+        semantic_fingerprint,
+        attrs
+      )
+    else
+      {:operator_input, reason, metadata} ->
+        block_preparation(task, actor, attrs, "operator_input", reason, metadata)
+
+      {:policy, reason} ->
+        block_preparation(task, actor, attrs, "policy", reason, %{
+          "policy_error" => Atom.to_string(reason)
+        })
+
+      {:error, reason} ->
+        Repo.rollback(reason)
+    end
+  end
+
+  defp replay_preparation(preparation, task, registration, actor) do
+    with {:ok, source} <- source_observation(task, registration),
+         {:ok, manifest} <- validate_manifest_registration(registration) do
+      contract = build_contract(task, registration, source, manifest)
+      semantic_fingerprint = semantic_fingerprint(task, registration, source, actor, contract)
+
+      if preparation.semantic_fingerprint == semantic_fingerprint do
+        preparation_result(preparation, true) |> unwrap_or_rollback()
+      else
+        Repo.rollback(:preparation_conflict)
+      end
+    else
+      _ -> Repo.rollback(:preparation_conflict)
     end
   end
 
@@ -118,10 +153,6 @@ defmodule Sxf.TaskPreparation do
          semantic_fingerprint,
          attrs
        ) do
-    if task.state != "DISCOVERED" do
-      Repo.rollback(:task_not_discovered)
-    end
-
     if DateTime.compare(attrs.prepared_at, task.last_transition_at) == :lt do
       Repo.rollback(:out_of_order_preparation)
     end
@@ -160,6 +191,34 @@ defmodule Sxf.TaskPreparation do
       idempotent?: false
     }
   end
+
+  defp block_preparation(task, actor, attrs, kind, reason, metadata) do
+    reason_text = preparation_failure_reason(reason)
+
+    case Tasks.block_task(task.id, %{
+           actor_id: actor.id,
+           kind: kind,
+           reason: reason_text,
+           reason_code: "task_preparation_#{kind}",
+           occurred_at: attrs.prepared_at,
+           correlation_id: attrs.correlation_id,
+           idempotency_key:
+             "task-preparation:block:#{fingerprint(%{task_id: task.id, kind: kind, reason: reason, metadata: metadata})}",
+           blocker_metadata:
+             Map.merge(metadata, %{
+               "preparation_failure" => Atom.to_string(reason)
+             })
+         }) do
+      {:ok, _result} -> {:blocked, reason}
+      {:error, block_error} -> Repo.rollback(block_error)
+    end
+  end
+
+  defp preparation_failure_reason(:multiple_processed_source_versions),
+    do: "multiple processed source versions require operator selection before preparation"
+
+  defp preparation_failure_reason(reason),
+    do: "manifest authority rejected task preparation: #{reason}"
 
   defp create_budget(preparation, task, manifest) do
     budgets = manifest["budgets"]
@@ -298,43 +357,54 @@ defmodule Sxf.TaskPreparation do
     end
   end
 
-  defp latest_source_observation(task, registration) do
-    source =
-      Repo.one(
+  defp source_observation(task, registration) do
+    sources =
+      Repo.all(
         from inbox in ExternalEventInboxReference,
           where: inbox.task_id == ^task.id and inbox.status == "processed",
-          order_by: [
-            desc: inbox.processed_at,
-            desc: inbox.received_at,
-            desc: inbox.inserted_at,
-            desc: inbox.id
-          ],
-          limit: 1
-      ) || Repo.rollback(:source_observation_not_found)
+          order_by: [asc: inbox.source_version, asc: inbox.id]
+      )
 
+    case sources do
+      [] ->
+        {:error, :source_observation_not_found}
+
+      [source] ->
+        validate_source_observation(source, task, registration)
+
+      sources ->
+        {:operator_input, :multiple_processed_source_versions,
+         %{
+           "source_versions" => Enum.map(sources, & &1.source_version),
+           "source_inbox_ids" => Enum.map(sources, & &1.id)
+         }}
+    end
+  end
+
+  defp validate_source_observation(source, task, registration) do
     metadata = source.metadata
 
     cond do
       source.source != registration.provider ->
-        Repo.rollback(:source_repository_mismatch)
+        {:error, :source_repository_mismatch}
 
       metadata["repository_external_id"] != registration.external_id ->
-        Repo.rollback(:source_repository_mismatch)
+        {:error, :source_repository_mismatch}
 
       metadata["issue_external_id"] != task.source_ref ->
-        Repo.rollback(:source_issue_mismatch)
+        {:error, :source_issue_mismatch}
 
       not valid_string?(metadata["title"]) ->
-        Repo.rollback(:source_observation_incomplete)
+        {:error, :source_observation_incomplete}
 
       not is_binary(metadata["body"]) or not String.valid?(metadata["body"]) ->
-        Repo.rollback(:source_observation_incomplete)
+        {:error, :source_observation_incomplete}
 
       not is_map(metadata["attributes"]) ->
-        Repo.rollback(:source_observation_incomplete)
+        {:error, :source_observation_incomplete}
 
       true ->
-        source
+        {:ok, source}
     end
   end
 
@@ -349,22 +419,22 @@ defmodule Sxf.TaskPreparation do
 
     cond do
       is_nil(registration.manifest_schema_version) ->
-        Repo.rollback(:registration_incomplete)
+        {:policy, :registration_incomplete}
 
       registration.manifest_schema_version != "0.1" ->
-        Repo.rollback(:unsupported_manifest_version)
+        {:policy, :unsupported_manifest_version}
 
       not valid_sha256?(registration.registration_fingerprint) ->
-        Repo.rollback(:registration_incomplete)
+        {:policy, :registration_incomplete}
 
       not valid_sha256?(registration.raw_manifest_sha256) ->
-        Repo.rollback(:registration_incomplete)
+        {:policy, :registration_incomplete}
 
       not is_map(manifest) ->
-        Repo.rollback(:registration_incomplete)
+        {:policy, :registration_incomplete}
 
       manifest["schemaVersion"] != "0.1" ->
-        Repo.rollback(:registration_incomplete)
+        {:policy, :registration_incomplete}
 
       true ->
         validate_manifest_authority(manifest)
@@ -381,26 +451,32 @@ defmodule Sxf.TaskPreparation do
     cond do
       not is_map(commands) or not valid_string?(commands["install"]) or
           not valid_string?(commands["test"]) ->
-        Repo.rollback(:manifest_commands_incomplete)
+        {:policy, :manifest_commands_incomplete}
 
       not is_map(autonomy) or autonomy["createBranches"] != true ->
-        Repo.rollback(:branch_creation_not_authorized)
+        {:policy, :branch_creation_not_authorized}
 
       autonomy["openPullRequests"] != true ->
-        Repo.rollback(:pull_request_creation_not_authorized)
+        {:policy, :pull_request_creation_not_authorized}
+
+      autonomy["mergeToDefault"] != false ->
+        {:policy, :merge_to_default_not_authorized}
+
+      autonomy["deployToProduction"] != false ->
+        {:policy, :production_deployment_not_authorized}
 
       not is_map(verification) or verification["independent"] != true or
           verification["requireDeterministicChecks"] != true ->
-        Repo.rollback(:manifest_verification_incomplete)
+        {:policy, :manifest_verification_incomplete}
 
       not is_map(restrictions) ->
-        Repo.rollback(:manifest_restrictions_incomplete)
+        {:policy, :manifest_restrictions_incomplete}
 
       not valid_m3_budgets?(budgets) ->
-        Repo.rollback(:manifest_budget_outside_m3_ceiling)
+        {:policy, :manifest_budget_outside_m3_ceiling}
 
       true ->
-        manifest
+        {:ok, manifest}
     end
   end
 
@@ -444,6 +520,7 @@ defmodule Sxf.TaskPreparation do
         "defaultBranch" => registration.default_branch
       },
       "commands" => manifest["commands"],
+      "commandPlan" => ordered_command_plan(manifest["commands"]),
       "autonomy" => manifest["autonomy"],
       "verification" => manifest["verification"],
       "restrictions" => manifest["restrictions"],
@@ -455,6 +532,16 @@ defmodule Sxf.TaskPreparation do
         "maxProviderRetries" => @m3_max_provider_retries
       }
     }
+  end
+
+  defp ordered_command_plan(commands) do
+    ~w(install lint typecheck test integrationTest build)
+    |> Enum.flat_map(fn name ->
+      case Map.get(commands, name) do
+        command when is_binary(command) -> [%{"name" => name, "command" => command}]
+        _ -> []
+      end
+    end)
   end
 
   defp semantic_fingerprint(task, registration, source, actor, contract) do
@@ -559,6 +646,7 @@ defmodule Sxf.TaskPreparation do
   defp unwrap_or_rollback({:ok, value}), do: value
   defp unwrap_or_rollback({:error, reason}), do: Repo.rollback(reason)
 
+  defp flatten_transaction({:ok, {:blocked, reason}}), do: {:error, reason}
   defp flatten_transaction({:ok, result}), do: {:ok, result}
   defp flatten_transaction({:error, reason}), do: {:error, reason}
 end

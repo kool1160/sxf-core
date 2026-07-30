@@ -12,15 +12,19 @@ the following in one immediate SQLite transaction:
 
 1. choose a due durable retry by `(due_at, sequence, id)`, or a `READY` task by
    `(last_transition_at, id)`;
-2. verify that execution budget remains and no active attempt or lease exists;
+2. verify exactly one complete immutable preparation, its one active task budget, the unchanged
+   registration fingerprint, no newer processed source observation, remaining capacity, and no
+   active attempt or lease;
 3. create the next running attempt;
 4. acquire a lease with the next monotonically increasing fencing token; and
 5. append the transition event and project the task to `IMPLEMENTING`.
 
-Concurrent ticks are serialized by SQLite and the lifecycle transition. A dispatch fingerprint
-covers caller-accepted semantic input, including the worker, backend, actor, and explicit dispatch
-contract. Control-plane-generated observation times, expiries, and correlation IDs do not make an
-otherwise identical replay conflict. An exact replay reconstructs the original durable claim and
+Concurrent ticks are serialized by SQLite and the lifecycle transition. The durable claim and
+provider-neutral context load the frozen preparation record, complete execution contract, and
+preparation semantic fingerprint. The dispatch fingerprint covers the worker, backend, actor, and
+that preparation fingerprint. Caller `dispatch_input` is rejected; it cannot override or broaden
+the persisted contract. Control-plane-generated observation times, expiries, and correlation IDs
+do not make an otherwise identical replay conflict. An exact replay reconstructs the original durable claim and
 does not invoke workspace, sandbox, or agent boundaries again, whether the original execution is
 active or complete. Changed semantic input conflicts. Terminal tasks and tasks outside the eligible
 states are never selected. If an independent SQLite connection loses immediate-transaction lock

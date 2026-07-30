@@ -192,11 +192,8 @@ defmodule Sxf.SQLiteClaimContentionRunner do
   end
 
   defp ready_fixture do
-    fixture = domain_fixture()
-    {:ok, %{task: task}} = transition(fixture.task, fixture.system_actor, "SPECIFIED", 1)
-    {:ok, %{task: task}} = transition(task, fixture.system_actor, "PLANNED", 2)
-    {:ok, %{task: task}} = transition(task, fixture.system_actor, "READY", 3)
-    %{fixture | task: task}
+    domain_fixture()
+    |> execution_preparation_fixture()
   end
 
   defp claim_attrs(fixture, suffix) do

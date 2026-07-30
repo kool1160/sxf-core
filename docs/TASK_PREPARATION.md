@@ -15,9 +15,11 @@ correlation, and idempotency envelopes do not change otherwise identical semanti
 
 The task must still be `DISCOVERED`. Its project must be active, its repository registration must
 belong to that project, and the registration must contain a complete accepted `0.1` normalized
-manifest. The latest processed inbox observation must belong to the same task, provider, stable
-repository ID, and stable issue ID. A later observation after preparation is a conflict; M3 does
-not silently replace already prepared work.
+manifest. Exactly one processed inbox source version must belong to the same task, provider,
+stable repository ID, and stable issue ID. Multiple processed versions before preparation
+atomically create an `operator_input` blocker and move `DISCOVERED -> BLOCKED`; M3 does not guess
+which version to execute. A later observation after preparation revokes claim eligibility rather
+than silently replacing already prepared work.
 
 ## Effective contract
 
@@ -28,7 +30,8 @@ The immutable preparation record pins:
 - the exact processed inbox record, source version, and canonical payload hash;
 - bounded untrusted issue title, body, and display metadata;
 - repository owner/name, clone URL, and default branch;
-- inert normalized commands;
+- inert normalized commands and the ordered execution plan (`install`, optional `lint`, optional
+  `typecheck`, `test`, optional `integrationTest`, optional `build`);
 - effective autonomy and verification requirements;
 - protected paths, prohibited actions, and allowed network domains; and
 - exact durable M3 task budgets.
@@ -38,10 +41,12 @@ pull-request mutation, weaken verification or restrictions, broaden network acce
 repository identity, or raise a budget.
 
 Preparation requires the accepted manifest to authorize `createBranches` and `openPullRequests`,
-to retain deterministic install and test commands, and to fit inside ADR 0004's M3 ceilings. The
-task budget preserves the manifest's equal-or-lower cost, runtime, turn, and zero-repair limits,
-converts runtime minutes to exact integer milliseconds, and applies the approved provider-retry
-limit of two.
+explicitly deny `mergeToDefault` and `deployToProduction`, retain deterministic install and test
+commands, and fit inside ADR 0004's M3 ceilings. A missing, malformed, or over-authority manifest
+atomically creates a `policy` blocker and moves `DISCOVERED -> BLOCKED`; it creates no preparation
+or budget. The task budget preserves the manifest's equal-or-lower cost, runtime, turn, and
+zero-repair limits, converts runtime minutes to exact integer milliseconds, and applies the
+approved provider-retry limit of two.
 
 ## Atomic promotion and replay
 
@@ -56,6 +61,12 @@ Exact semantic replay returns the original preparation, budget, and events. Chan
 registration, source observation, payload, or effective contract conflicts. Independent SQLite
 connections serialize to one preparation and one budget; lookup after Repo restart depends only
 on durable state.
+
+The coordinator can claim a task only while exactly one complete preparation and its one active
+task budget remain coherent, the registration fingerprint is unchanged, and no newer processed
+source observation exists. The claim and provider-neutral execution context carry the immutable
+preparation, contract, and semantic fingerprint. Caller `dispatch_input` is rejected and cannot
+replace or supplement durable authority.
 
 Preparation creates no attempt, lease, retry, blocker, usage, evidence, outbox action, workspace,
 sandbox, branch, agent session, or external effect. `READY` only makes the task eligible for the

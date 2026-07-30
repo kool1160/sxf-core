@@ -168,11 +168,15 @@ not silently update an accepted registration.
 reload repository bytes or trust issue text to supply commands or policy. Before a `DISCOVERED`
 external-issue task can become `READY`, the gate requires inert install/test commands, effective
 branch and pull-request authority, mandatory verification, and budgets within ADR 0004's M3
-ceilings. It creates one exact task budget and pins the registration fingerprint in the immutable
-preparation contract.
+ceilings. It additionally rejects merge-to-default and production-deployment authority. It creates
+one exact task budget, pins the registration fingerprint in the immutable preparation contract,
+and stores commands in deterministic execution order.
 
-Preparation never executes a command. Changed registration or source semantics conflict rather
-than silently replacing already prepared work. See [`TASK_PREPARATION.md`](TASK_PREPARATION.md).
+Preparation never executes a command. Multiple processed source versions create an
+`operator_input` blocker; invalid manifest authority creates a `policy` blocker. Both failures move
+the task from `DISCOVERED` to `BLOCKED` without a preparation or budget. Changed registration or
+source semantics conflict rather than silently replacing already prepared work. See
+[`TASK_PREPARATION.md`](TASK_PREPARATION.md).
 
 ## Safety boundary
 

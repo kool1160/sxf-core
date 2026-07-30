@@ -361,6 +361,9 @@ defmodule Sxf.Execution.Coordinator do
       actor_id: state.actor_id,
       correlation_id: correlation_id,
       started_at: claim.attempt.started_at,
+      preparation: claim.preparation,
+      preparation_contract: claim.preparation_contract,
+      preparation_fingerprint: claim.preparation_fingerprint,
       options: state.backend_options
     }
 
@@ -742,6 +745,9 @@ defmodule Sxf.Execution.Coordinator do
       actor_id: state.actor_id,
       correlation_id: correlation_id,
       started_at: claim.attempt.started_at,
+      preparation: claim.preparation,
+      preparation_contract: claim.preparation_contract,
+      preparation_fingerprint: claim.preparation_fingerprint,
       options: state.backend_options
     }
 

@@ -41,11 +41,17 @@ transaction, so validation, actor, constraint, database, and concurrent-writer f
 leave an orphan project. Lookup and replay depend only on durable SQLite state after restart.
 
 Manifest-gated preparation is naturally unique by task ID. Its fingerprint pins the accepted
-registration, latest processed issue observation, system actor, and effective contract while
+registration, sole processed issue observation, system actor, ordered command plan, and effective contract while
 excluding fresh timestamp, correlation, and idempotency envelopes. One immediate transaction
 creates the preparation, task budget, and three lifecycle facts through `READY`. Exact replay and
 independent SQLite contention return that one authority; changed source or manifest semantics
-conflict, and failure leaves the task `DISCOVERED`.
+conflict. Multiple processed source versions durably block for `operator_input`; invalid manifest
+authority durably blocks for `policy`; neither failure creates a preparation or budget.
+
+Execution claims revalidate the complete preparation, its sole active task budget, the pinned
+registration fingerprint, and source-version freshness. The preparation semantic fingerprint is
+part of claim idempotency and the frozen contract is loaded into both claim and context. Caller
+dispatch data is not accepted as authority.
 
 ## Failure classes
 

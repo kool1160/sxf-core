@@ -132,7 +132,10 @@ is deliberately enforced in changesets and the state machine rather than a SQLit
 `Sxf.TaskPreparation.prepare/1` owns the first lifecycle promotion after external intake. One
 immediate transaction inserts the immutable preparation and task budget, then appends the legal
 `SPECIFIED`, `PLANNED`, and `READY` facts. Its authority is the active task-owned project, complete
-accepted repository registration, normalized manifest, and latest processed inbox observation.
+accepted repository registration, normalized manifest, and one unambiguous processed inbox
+observation. Multiple source versions instead create an `operator_input` blocker; invalid manifest
+authority creates a `policy` blocker. Each failure atomically appends `DISCOVERED -> BLOCKED` and
+creates no preparation or budget.
 Composite foreign keys enforce task/project, registration/project, and inbox/task ownership.
 Exact semantic replay returns the original records; changed authority conflicts. See
 [`TASK_PREPARATION.md`](TASK_PREPARATION.md).
@@ -213,13 +216,15 @@ creates another inbox observation but reconciles the same task. Budget, outbox, 
 reserve stable keys or natural unique scopes for their command handlers. Unknown outbox state
 remains `unknown` until observed; it is never inferred to be successful.
 
-Dispatch-command fingerprints cover accepted semantic input but deliberately exclude fresh
-control-plane observation times, calculated lease expiries, and generated correlation IDs. An
-exact dispatch replay returns the durable claim without repeating external preparation or agent
-execution. Changed accepted dispatch input conflicts.
+Dispatch-command fingerprints cover the frozen preparation semantic fingerprint together with the
+worker, actor, and backend, but deliberately exclude fresh control-plane observation times,
+calculated lease expiries, and generated correlation IDs. Caller dispatch input is rejected. An
+exact dispatch replay returns the durable claim and contract without repeating external
+preparation or agent execution.
 
 Task preparation is naturally unique by task ID. Its semantic fingerprint includes the accepted
-registration, latest processed source observation, preparing actor, and effective contract while
+registration, sole processed source observation, preparing actor, ordered command plan, and
+effective contract while
 excluding fresh time, correlation, and idempotency envelopes. Independent concurrent writers
 therefore produce one preparation, budget, and transition sequence.
 

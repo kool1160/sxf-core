@@ -59,7 +59,10 @@ ceilings, override a project manifest, or authorize a protected action. Intake f
 before issue text is supplied to later planning or execution. The separate task-preparation gate
 then pins the accepted registration, latest processed observation, normalized commands,
 restrictions, autonomy, verification, and M3 budgets before the task becomes `READY`. Neither the
-label nor issue text can bypass that gate.
+label nor issue text can bypass that gate. Preparation rejects merge-to-default and production
+deployment authority, persists commands in a fixed deterministic order, and durably blocks
+ambiguous source versions or invalid policy. Dispatch revalidates the pinned authority and rejects
+caller-supplied contract input.
 
 Connected-project manifests are untrusted repository content. Validation rejects autonomy, network,
 budget, or verification requests outside platform-owned policy, unions restrictive policy, and
