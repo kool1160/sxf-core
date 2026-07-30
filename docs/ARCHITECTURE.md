@@ -65,8 +65,13 @@ fetches the complete bounded open-issue view for the exact `sxf:ready` label, ex
 requests, constructs canonical observations, and calls the provider-neutral atomic
 inbox-to-`DISCOVERED` task command. Authentication, transport, clock, private-key resolution, and
 correlation generation are replaceable boundaries. The poller does not schedule itself, dispatch
-work, execute manifest commands, or mutate GitHub. Manifest discovery and manifest-gated task
-promotion remain later M3 work.
+work, execute manifest commands, or mutate GitHub.
+
+`Sxf.TaskPreparation` is the separate manifest gate after intake. It pins the accepted repository
+registration and latest processed observation, fixes the effective task contract and M3 budget,
+and atomically appends `SPECIFIED`, `PLANNED`, and `READY`. Issue content remains untrusted request
+data and cannot broaden the normalized manifest. Preparation performs no external effect and does
+not dispatch the newly eligible task. See [`TASK_PREPARATION.md`](TASK_PREPARATION.md).
 
 ### State machine
 

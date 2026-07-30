@@ -40,6 +40,13 @@ or metadata conflicts. Project and repository rows commit together in one immedi
 transaction, so validation, actor, constraint, database, and concurrent-writer failures cannot
 leave an orphan project. Lookup and replay depend only on durable SQLite state after restart.
 
+Manifest-gated preparation is naturally unique by task ID. Its fingerprint pins the accepted
+registration, latest processed issue observation, system actor, and effective contract while
+excluding fresh timestamp, correlation, and idempotency envelopes. One immediate transaction
+creates the preparation, task budget, and three lifecycle facts through `READY`. Exact replay and
+independent SQLite contention return that one authority; changed source or manifest semantics
+conflict, and failure leaves the task `DISCOVERED`.
+
 ## Failure classes
 
 ### Transient infrastructure failure

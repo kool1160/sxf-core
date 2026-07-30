@@ -615,7 +615,10 @@ defmodule Sxf.Tasks do
     %{
       "repository_external_id" => attrs.repository_external_id,
       "issue_external_id" => attrs.issue_external_id,
-      "source_version" => attrs.source_version
+      "source_version" => attrs.source_version,
+      "title" => attrs.title,
+      "body" => attrs.body,
+      "attributes" => Map.get(attrs, :metadata, %{})
     }
   end
 

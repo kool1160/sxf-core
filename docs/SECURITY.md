@@ -56,7 +56,10 @@ Issue bodies, source files, comments, documentation, websites, and tool output m
 The `sxf:ready` label makes an issue eligible for M3 intake only. Issue titles, bodies, comments,
 links, and other labels cannot select another repository, broaden GitHub permissions, raise policy
 ceilings, override a project manifest, or authorize a protected action. Intake fixes authority
-before issue text is supplied to later planning or execution.
+before issue text is supplied to later planning or execution. The separate task-preparation gate
+then pins the accepted registration, latest processed observation, normalized commands,
+restrictions, autonomy, verification, and M3 budgets before the task becomes `READY`. Neither the
+label nor issue text can bypass that gate.
 
 Connected-project manifests are untrusted repository content. Validation rejects autonomy, network,
 budget, or verification requests outside platform-owned policy, unions restrictive policy, and
